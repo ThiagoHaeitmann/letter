@@ -990,6 +990,22 @@ namespace Mail.Utils {
             if (addr.has_prefix ("<") && addr.has_suffix (">") && addr.length > 2)
                 addr = addr.substring (1, addr.length - 2).strip ();
 
+            /* Older Letter builds could glue bare emails into the display name
+             * before <addr> when quoting commas. Expand those back out. */
+            if (looks_like_merged_address_name (display)) {
+                var rebuilt = addr.length > 0 && display.down () != addr.down ()
+                    ? "%s <%s>".printf (display, addr)
+                    : display;
+                var expanded = recipients_from_address (
+                    internet_address_from_header_raw (rebuilt)
+                );
+                if (expanded.length > 1) {
+                    for (uint e = 0; e < expanded.length; e++)
+                        result.add (expanded[e]);
+                    continue;
+                }
+            }
+
             result.add (new Recipient () {
                 name = display,
                 email = addr,
@@ -997,6 +1013,12 @@ namespace Mail.Utils {
         }
 
         return result;
+    }
+
+    private static bool looks_like_merged_address_name (string display) {
+        if (!display.contains ("@"))
+            return false;
+        return display.contains (",") || display.contains (";");
     }
 
     public static string sanitize_recipient_text (string? raw) {
@@ -1931,6 +1953,15 @@ namespace Mail.Utils {
         return address;
     }
 
+    /* Decode without the comma-name quoting pass — used to expand already
+     * mangled display names from older Sent copies. */
+    private static Camel.InternetAddress internet_address_from_header_raw (string? raw) {
+        var address = new Camel.InternetAddress ();
+        if (raw != null && raw.strip ().length > 0)
+            address.decode (raw.strip ());
+        return address;
+    }
+
     public static string format_recipient_list (GenericArray<Recipient> recipients) {
         var address = new Camel.InternetAddress ();
         for (uint i = 0; i < recipients.length; i++)
@@ -1982,6 +2013,9 @@ namespace Mail.Utils {
         };
     }
 
+    /* Quote display names that contain commas (Last, First <a@b>) so Camel
+     * does not treat the comma as an address separator — but never swallow
+     * preceding bare emails into that name. */
     private static string quote_unquoted_angle_names (string raw) {
         if (raw.index_of_char ('<') < 0)
             return raw;
@@ -2023,24 +2057,127 @@ namespace Mail.Utils {
 
             var name = raw.substring (cursor, lt - cursor).strip ();
             var angle = raw.substring (lt, gt - lt + 1);
-            if (!first)
-                result.append (", ");
-            first = false;
+            string display;
+            append_leading_mailbox_tokens (result, name, first, out display, out first);
 
-            if (name.length > 0
-                && !name.has_prefix ("\"")
-                && (name.contains (",") || name.contains (";"))) {
+            if (display.length > 0
+                && !display.has_prefix ("\"")
+                && (display.contains (",") || display.contains (";"))) {
+                if (!first)
+                    result.append (", ");
+                first = false;
                 result.append ("\"");
-                result.append (name.replace ("\"", "\\\""));
+                result.append (display.replace ("\"", "\\\""));
                 result.append ("\" ");
-            } else if (name.length > 0) {
-                result.append (name);
+                result.append (angle);
+            } else if (display.length > 0) {
+                if (!first)
+                    result.append (", ");
+                first = false;
+                result.append (display);
                 result.append (" ");
+                result.append (angle);
+            } else {
+                if (!first)
+                    result.append (", ");
+                first = false;
+                result.append (angle);
             }
-            result.append (angle);
             cursor = gt + 1;
         }
         return result.str;
+    }
+
+    /* Peel bare email tokens off the left of text before <addr>. Remaining
+     * text is the display name (may still contain commas, e.g. Last, First). */
+    private static void append_leading_mailbox_tokens (
+        StringBuilder result,
+        string name,
+        bool first_in,
+        out string display,
+        out bool first_out
+    ) {
+        display = name;
+        first_out = first_in;
+        if (name.length == 0 || (!name.contains (",") && !name.contains (";")))
+            return;
+
+        var tokens = new GenericArray<string> ();
+        split_address_list_tokens (name, tokens);
+        if (tokens.length <= 1)
+            return;
+
+        uint keep_from = 0;
+        while (keep_from < tokens.length) {
+            if (!token_looks_like_email (tokens[keep_from]))
+                break;
+            keep_from++;
+        }
+
+        /* If we peeled nothing, the commas belong to the display name. */
+        if (keep_from == 0)
+            return;
+
+        /* If every token looked like email, they are all bare addresses and
+         * display stays empty (angle addr stands alone). */
+        for (uint i = 0; i < keep_from; i++) {
+            if (!first_out)
+                result.append (", ");
+            first_out = false;
+            result.append (tokens[i]);
+        }
+
+        if (keep_from >= tokens.length) {
+            display = "";
+            return;
+        }
+
+        var builder = new StringBuilder ();
+        for (uint i = keep_from; i < tokens.length; i++) {
+            if (builder.len > 0)
+                builder.append (", ");
+            builder.append (tokens[i]);
+        }
+        display = builder.str;
+    }
+
+    private static void split_address_list_tokens (string raw, GenericArray<string> tokens) {
+        var current = new StringBuilder ();
+        var in_quotes = false;
+        int i = 0;
+        unichar ch;
+        while (raw.get_next_char (ref i, out ch)) {
+            if (ch == '"') {
+                in_quotes = !in_quotes;
+                current.append_unichar (ch);
+                continue;
+            }
+            if (!in_quotes && (ch == ',' || ch == ';')) {
+                var token = current.str.strip ();
+                if (token.length > 0)
+                    tokens.add (token);
+                current = new StringBuilder ();
+                continue;
+            }
+            current.append_unichar (ch);
+        }
+        var last = current.str.strip ();
+        if (last.length > 0)
+            tokens.add (last);
+    }
+
+    private static bool token_looks_like_email (string token) {
+        var text = token.strip ();
+        if (text.has_prefix ("mailto:"))
+            text = text.substring (7).strip ();
+        if (text.has_prefix ("<") && text.has_suffix (">") && text.length > 2)
+            text = text.substring (1, text.length - 2).strip ();
+        var at = text.index_of_char ('@');
+        if (at <= 0 || at >= text.length - 1)
+            return false;
+        if (text.contains (" ") || text.contains ("\t"))
+            return false;
+        return text.substring (at + 1).contains (".");
     }
 
     public static string reply_subject (string subject) {

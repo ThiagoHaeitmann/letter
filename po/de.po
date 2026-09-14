@@ -629,6 +629,10 @@ msgstr "Alle als gelesen markieren"
 msgid "Mark All as Unread"
 msgstr "Alle als ungelesen markieren"
 
+#: src/window.vala:7789
+msgid "Update Folder"
+msgstr "Ordner aktualisieren"
+
 #: src/window.vala:7397 src/window.vala:7471
 msgid "Empty"
 msgstr "Leeren"

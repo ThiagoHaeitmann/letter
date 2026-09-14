@@ -19,7 +19,19 @@ refactors unless they affect behaviour.
 
 ## [Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.3...HEAD)
 
+### Changed
 
+- Archive / Sent no longer chase Microsoft 365 Online Archive count drift with
+  background `refresh_info`. One silent Graph refresh runs once at startup.
+  Context menu **Update Folder** refreshes one folder on demand.
+
+### Fixed
+
+- Compose / Sent recipient chips no longer glue bare addresses into the next
+  `Name <email>` entry when the To list mixes plain emails and display names
+  (also repairs “Send again” and older mangled Sent headers when possible).
+- Compose recipient field no longer storms the GDK frame clock with continuous
+  layout requests while typing addresses (WrapBox + expanding entry).
 
 ## [1.0.0-rc.3](https://github.com/stalvatero/letter/compare/v1.0.0-rc.2...v1.0.0-rc.3) - 2026-09-14
 

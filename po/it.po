@@ -624,6 +624,10 @@ msgstr "Segna tutte come lette"
 msgid "Mark All as Unread"
 msgstr "Segna tutte come non lette"
 
+#: src/window.vala:7789
+msgid "Update Folder"
+msgstr "Aggiorna cartella"
+
 #: src/window.vala:7397 src/window.vala:7471
 msgid "Empty"
 msgstr "Svuota"

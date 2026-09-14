@@ -25,7 +25,10 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
     private const int SUGGEST_MAX_HEIGHT = 260;
     private const int SUGGEST_MIN_WIDTH = 280;
     private const int SUGGEST_MAX_WIDTH = 380;
-    private const int INPUT_WIDTH_CHARS = 4;
+    private const int INPUT_WIDTH_CHARS = 8;
+    private int suggest_sized_width = -1;
+    private int suggest_sized_height = -1;
+    private uint suggest_point_source;
 
     private class Chip {
         public Recipient recipient;
@@ -124,12 +127,16 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
         };
         this.flow.add_css_class ("compose-recipient-flow");
 
+        /* Do not hexpand inside WrapBox: an expanding Gtk.Text fights the
+         * wrap measure/allocate cycle (gdk-frame-clock layout storm). */
         this.input = new Gtk.Text () {
-            hexpand = true,
+            hexpand = false,
             hexpand_set = true,
+            vexpand = false,
+            valign = Gtk.Align.CENTER,
             width_chars = INPUT_WIDTH_CHARS,
-            max_width_chars = INPUT_WIDTH_CHARS,
-            propagate_text_width = false,
+            max_width_chars = 40,
+            propagate_text_width = true,
             input_purpose = Gtk.InputPurpose.EMAIL,
         };
         this.input.add_css_class ("compose-recipient-input");
@@ -577,7 +584,6 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
 
         this.suggest_list.select_row (this.suggest_list.get_row_at_index (0));
         size_suggest (shown);
-        point_suggest ();
         if (!this.suggest_popover.visible)
             this.suggest_popover.popup ();
         keep_entry_focus ();
@@ -595,13 +601,35 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
         if (scroll)
             height = SUGGEST_MAX_HEIGHT;
 
+        if (width == this.suggest_sized_width
+            && height == this.suggest_sized_height
+            && this.suggest_popover != null
+            && this.suggest_popover.visible) {
+            queue_point_suggest ();
+            return;
+        }
+
+        this.suggest_sized_width = width;
+        this.suggest_sized_height = height;
         set_scrolled_content_size (this.suggest_scrolled, width, height);
         this.suggest_scrolled.vscrollbar_policy = scroll
             ? Gtk.PolicyType.AUTOMATIC
             : Gtk.PolicyType.NEVER;
-        this.suggest_popover.width_request = width;
-        this.suggest_popover.height_request = height;
-        point_suggest ();
+        /* Prefer content-size on the scrolled child; width/height_request on
+         * the popover during WrapBox layout can re-enter allocate. */
+        this.suggest_popover.width_request = -1;
+        this.suggest_popover.height_request = -1;
+        queue_point_suggest ();
+    }
+
+    private void queue_point_suggest () {
+        if (this.suggest_point_source != 0)
+            return;
+        this.suggest_point_source = Idle.add (() => {
+            this.suggest_point_source = 0;
+            point_suggest ();
+            return Source.REMOVE;
+        });
     }
 
     private void point_suggest () {
@@ -743,6 +771,12 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
             Source.remove (this.suggest_source);
             this.suggest_source = 0;
         }
+        if (this.suggest_point_source != 0) {
+            Source.remove (this.suggest_point_source);
+            this.suggest_point_source = 0;
+        }
+        this.suggest_sized_width = -1;
+        this.suggest_sized_height = -1;
         set_searching (false);
         this.suggest_shown_key = "";
         this.suggest_popover?.popdown ();

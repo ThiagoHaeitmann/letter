@@ -122,6 +122,8 @@ public class Mail.Window : Adw.ApplicationWindow {
     private HashTable<string, int64?> bulk_refresh_next_allowed;
     private HashTable<string, int> bulk_refresh_level;
     private HashTable<string, int64?> tip_refresh_last;
+    /* Account keys that already got the once-per-session silent Archive Graph refresh. */
+    private HashTable<string, uint8> startup_bulk_graph_done;
     private string? body_fill_folder;
     private bool sync_pump_running;
     private bool mailbox_bootstrapping;
@@ -264,6 +266,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.bulk_refresh_next_allowed = new HashTable<string, int64?> (str_hash, str_equal);
         this.bulk_refresh_level = new HashTable<string, int> (str_hash, str_equal);
         this.tip_refresh_last = new HashTable<string, int64?> (str_hash, str_equal);
+        this.startup_bulk_graph_done = new HashTable<string, uint8> (str_hash, str_equal);
         this.sync_jobs = new GenericArray<MailSyncJob> ();
         this.message_reader = new MessageReader ();
         this.message_reader.set_contacts (app.contacts);
@@ -852,6 +855,16 @@ public class Mail.Window : Adw.ApplicationWindow {
             || folder.kind == FolderKind.SENT;
     }
 
+    /* M365 Online/In-Place Archive keeps moving old mail out of the primary
+     * mailbox, so Graph totals on Archive/Sent almost never match Letter for
+     * long. Do not chase that with session-long refresh_info (except one
+     * silent startup shot and an explicit “Update Folder”). */
+    private static bool folder_skips_session_graph_refresh (Folder folder) {
+        return folder.kind == FolderKind.ARCHIVE
+            || folder.kind == FolderKind.ALL
+            || folder.kind == FolderKind.SENT;
+    }
+
     private static bool folder_is_incoming_watch (Folder folder) {
         if (folder.is_virtual_view || folder.is_gmail_namespace)
             return false;
@@ -1073,7 +1086,13 @@ public class Mail.Window : Adw.ApplicationWindow {
         return job.folder;
     }
 
-    private void enqueue_sync_job (int kind, Folder? folder, int rank, uint refresh_timeout = 0) {
+    private void enqueue_sync_job (
+        int kind,
+        Folder? folder,
+        int rank,
+        uint refresh_timeout = 0,
+        bool force_graph_refresh = false
+    ) {
         var name = folder != null ? folder.full_name : "";
         for (uint i = 0; i < this.sync_jobs.length; i++) {
             var job = this.sync_jobs[i];
@@ -1088,6 +1107,8 @@ public class Mail.Window : Adw.ApplicationWindow {
                 job.refresh_timeout_seconds,
                 refresh_timeout
             );
+            if (force_graph_refresh)
+                job.force_graph_refresh = true;
             return;
         }
 
@@ -1096,6 +1117,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         job.folder = folder;
         job.rank = rank;
         job.refresh_timeout_seconds = refresh_timeout;
+        job.force_graph_refresh = force_graph_refresh;
         this.sync_jobs.add (job);
     }
 
@@ -1132,7 +1154,13 @@ public class Mail.Window : Adw.ApplicationWindow {
                 mark_tip_refresh (account, folder);
         }
         demote_selected_sync_jobs (folder);
-        enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_SELECTED_HEADERS, 0);
+        /* Opening Archive/Sent must not start a Graph refresh_info chase
+         * (Online Archive count noise). Camel-local merge only unless the user
+         * chose Update Folder. */
+        var open_timeout = folder_skips_session_graph_refresh (folder)
+            ? MailSession.REFRESH_INFO_SKIP
+            : 0;
+        enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_SELECTED_HEADERS, open_timeout);
         if (!folder_skips_body_prefetch (folder)) {
             /* Bulk body fill stays behind Inbox; still runs within Preferences window. */
             var body_rank = folder_is_bulk_storage (folder)
@@ -1283,14 +1311,16 @@ public class Mail.Window : Adw.ApplicationWindow {
         schedule_folder_scout (20);
     }
 
-    /* After the folder tree is ready: sync the Inbox tree first, then scout
-     * other folders (cold empty cache / warm count drift from mobile). */
+    /* After the folder tree is ready: sync the Inbox tree first, then one
+     * silent Archive Graph refresh (session once). Scout no longer chases
+     * Online Archive count noise with refresh_info. */
     private void enqueue_background_after_tree (GenericArray<string> added) {
         Utils.sync_log (
             "cache-first: tree ready (%u new folder names) — syncing inbox tree".printf (added.length)
         );
         enqueue_incoming_folder_sync (RANK_SELECTED_HEADERS);
         watch_new_mail_folders.begin ();
+        enqueue_startup_bulk_graph_refresh ();
         schedule_folder_scout (3);
         /* Body window from Preferences — includes Archive/Sent once headers exist. */
         Timeout.add_seconds (8, () => {
@@ -1298,6 +1328,39 @@ public class Mail.Window : Adw.ApplicationWindow {
                 enqueue_cache_align ();
             return Source.REMOVE;
         });
+    }
+
+    /* One LOW-priority refresh_info for primary Archive after Inbox work —
+     * budget FULL (90s). Not repeated for the rest of the session. */
+    private void enqueue_startup_bulk_graph_refresh () {
+        var account = this.selected_account;
+        if (account == null || this.mail_session == null)
+            return;
+        if (account.kind == AccountKind.LOCAL || !account.has_mail)
+            return;
+
+        var account_key = account.source_uid ?? account.uid;
+        if (this.startup_bulk_graph_done.contains (account_key))
+            return;
+
+        var archive = find_folder_kind (FolderKind.ARCHIVE);
+        if (archive == null)
+            archive = find_folder_kind (FolderKind.ALL);
+        if (archive == null || !folder_skips_session_graph_refresh (archive))
+            return;
+
+        this.startup_bulk_graph_done.set (account_key, 1);
+        enqueue_sync_job (
+            SYNC_KIND_HEADERS,
+            archive,
+            RANK_IDLE_BULK,
+            MailSession.REFRESH_INFO_FULL,
+            true
+        );
+        Utils.sync_log (
+            "startup silent Graph refresh queued for “%s” (once this session)".printf (archive.name)
+        );
+        pump_sync.begin ();
     }
 
     /* After headers are current, keep downloading bodies in the configured window. */
@@ -1563,10 +1626,20 @@ public class Mail.Window : Adw.ApplicationWindow {
                 uint timeout = 0;
                 if (!scout_schedule_refresh (account, pick, pick_cold, pick_why, out timeout)) {
                     refresh_folder_badge (pick);
-                    Utils.sync_log ("folder scout defer “%s” (backoff, deficit≈%d)".printf (
-                        pick.name,
-                        pick_deficit
-                    ));
+                    if (folder_skips_session_graph_refresh (pick)) {
+                        Utils.sync_log (
+                            "folder scout skip Graph “%s” (session policy, %s, deficit≈%d)".printf (
+                                pick.name,
+                                pick_why,
+                                pick_deficit
+                            )
+                        );
+                    } else {
+                        Utils.sync_log ("folder scout defer “%s” (backoff, deficit≈%d)".printf (
+                            pick.name,
+                            pick_deficit
+                        ));
+                    }
                 } else {
                     enqueue_sync_job (SYNC_KIND_HEADERS, pick, RANK_IDLE_BULK, timeout);
                     refresh_folder_badge (pick);
@@ -1694,6 +1767,11 @@ public class Mail.Window : Adw.ApplicationWindow {
             return true;
         }
 
+        /* Online Archive / large Sent: Graph totals drift constantly. Never
+         * schedule refresh_info from scout — startup-once + Update Folder only. */
+        if (folder_skips_session_graph_refresh (folder))
+            return false;
+
         /* Small / incoming-adjacent folders: normal default budget. */
         if (!folder_is_bulk_storage (folder) && !MailSession.folder_is_heavy (folder)
             && folder.total <= 1500 && !cold) {
@@ -1794,9 +1872,12 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.tip_refresh_last.remove_all ();
     }
 
-    /* Sent/Drafts: tip can move while totals stay equal. */
+    /* Sent/Drafts: tip can move while totals stay equal — but Sent is also
+     * drained by Online Archive, so tip Graph refresh is session-skipped. */
     private static bool folder_wants_tip_refresh (Folder folder) {
-        return folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS;
+        if (folder_skips_session_graph_refresh (folder))
+            return false;
+        return folder.kind == FolderKind.DRAFTS;
     }
 
     private const int64 TIP_REFRESH_INTERVAL = 5 * 60 * TimeSpan.SECOND;
@@ -2038,31 +2119,39 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (job.kind == SYNC_KIND_HEADERS) {
             if (this.mail_session.folder_has_pending_flags (account, folder)) {
                 /* pump_sync defers these with a delay; keep as safety net. */
-                enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds);
+                enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds, job.force_graph_refresh);
                 return;
             }
             var current = is_current_folder (folder);
             if (current)
                 this.conversation_sync_spinner.visible = true;
-            /* Idle scout aligns stay quiet — only F5 / explicit sync show status
-             * for non-open folders; the open folder may still show Updating. */
+            /* Idle scout / startup-once Archive stay quiet. Open folder and
+             * explicit Update Folder show status. */
             var show_status = current || job.rank < RANK_IDLE_BULK;
             uint token = 0;
             if (show_status)
                 token = show_sync_status (_("Updating “%s”…").printf (folder.name));
-            /* Only the open folder uses HIGH Camel refresh — timer Inbox-tree
-             * children stay LOW so one hung Graph call cannot block reading. */
-            var high = current;
+            /* Only the open folder / explicit Update Folder use HIGH Camel
+             * refresh — timer Inbox-tree children stay LOW. */
+            var high = current || (job.force_graph_refresh && job.rank < RANK_IDLE_BULK);
             var refresh_timeout = job.refresh_timeout_seconds;
-            if (current)
+            if (job.force_graph_refresh) {
+                if (refresh_timeout == MailSession.REFRESH_INFO_SKIP)
+                    refresh_timeout = 0;
+            } else if (folder_skips_session_graph_refresh (folder)) {
+                /* Session policy: no Graph refresh_info on Archive/Sent except
+                 * the one-shot startup job / Update Folder (force flag). */
+                refresh_timeout = MailSession.REFRESH_INFO_SKIP;
+            } else if (current) {
                 refresh_timeout = 0;
+            }
             var aligned = false;
             try {
                 yield align_folder_with_server (account, folder, cancellable, high, refresh_timeout);
                 aligned = !cancellable.is_cancelled ();
             } catch (Error e) {
                 if (Utils.is_cancelled_error (e) || cancellable.is_cancelled ()) {
-                    enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds);
+                    enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds, job.force_graph_refresh);
                     Utils.sync_log ("headers “%s” interrupted — requeued".printf (folder.name));
                 } else {
                     debug ("Headers %s: %s", folder.name, e.message);
@@ -2078,7 +2167,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                     yield note_scout_align_result (account, folder, refresh_timeout);
                 enqueue_body_prefetch_after_headers (folder, current);
             } else if (cancellable.is_cancelled ()) {
-                enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds);
+                enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds, job.force_graph_refresh);
             }
             return;
         }
@@ -2227,7 +2316,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                     && job.kind == SYNC_KIND_HEADERS
                     && job.folder != null
                     && this.mail_session.folder_has_pending_flags (account, job.folder)) {
-                    enqueue_sync_job (job.kind, job.folder, job.rank, job.refresh_timeout_seconds);
+                    enqueue_sync_job (job.kind, job.folder, job.rank, job.refresh_timeout_seconds, job.force_graph_refresh);
                     Timeout.add (500, pump_sync.callback);
                     yield;
                     continue;
@@ -7642,6 +7731,18 @@ public class Mail.Window : Adw.ApplicationWindow {
         mark_unread.activate.connect (() => mark_folder_seen.begin (folder, false));
         group.add_action (mark_unread);
 
+        var update = new SimpleAction ("update-folder", null);
+        var account = this.selected_account;
+        update.set_enabled (
+            !folder.is_virtual_view
+            && account != null
+            && account.kind != AccountKind.LOCAL
+            && account.has_mail
+            && network_is_available ()
+        );
+        update.activate.connect (() => update_folder_from_server (folder));
+        group.add_action (update);
+
         var trash_action = new SimpleAction ("move-trash", null);
         trash_action.set_enabled (!folder.is_server_required && !in_trash);
         trash_action.activate.connect (() => confirm_trash_folder.begin (folder));
@@ -7682,6 +7783,8 @@ public class Mail.Window : Adw.ApplicationWindow {
         var seen_section = new Menu ();
         seen_section.append (_("Mark All as Read"), "ctx.mark-all-read");
         seen_section.append (_("Mark All as Unread"), "ctx.mark-all-unread");
+        if (!folder.is_virtual_view)
+            seen_section.append (_("Update Folder"), "ctx.update-folder");
         menu.append_section (null, seen_section);
 
         var delete_section = new Menu ();
@@ -7697,6 +7800,35 @@ public class Mail.Window : Adw.ApplicationWindow {
             menu.append_section (null, delete_section);
 
         popup_context_menu (row, menu, group, x, y);
+    }
+
+    /* Explicit Graph refresh_info for one folder — the only mid-session path
+     * that may call refresh_info on Archive/Sent (Online Archive noise). */
+    private void update_folder_from_server (Folder folder) {
+        if (folder.is_virtual_view || this.mail_session == null)
+            return;
+        var account = this.selected_account;
+        if (account == null || account.kind == AccountKind.LOCAL || !account.has_mail)
+            return;
+        if (!network_is_available ())
+            return;
+
+        Utils.sync_log ("Update Folder: Graph refresh “%s”".printf (folder.name));
+        clear_bulk_refresh_backoff (account, folder);
+        enqueue_sync_job (
+            SYNC_KIND_HEADERS,
+            folder,
+            RANK_SELECTED_HEADERS,
+            0,
+            true
+        );
+        if (!folder_skips_body_prefetch (folder)) {
+            var body_rank = folder_is_bulk_storage (folder)
+                ? RANK_CACHE_ALIGN
+                : RANK_SELECTED_BODIES;
+            enqueue_sync_job (SYNC_KIND_BODIES, folder, body_rank);
+        }
+        pump_sync.begin ();
     }
 
     private void popup_bookmarks_folder_menu (FolderRow row, double x, double y) {
@@ -8807,4 +8939,6 @@ private class Mail.MailSyncJob : Object {
     public int rank;
     /* 0 = default HIGH/LOW timeouts; REFRESH_INFO_SKIP = Camel merge only. */
     public uint refresh_timeout_seconds;
+    /* User “Update Folder” or the one-shot startup Archive refresh. */
+    public bool force_graph_refresh;
 }
