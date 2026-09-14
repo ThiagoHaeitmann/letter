@@ -52,7 +52,20 @@
     <category>Email</category>
   </categories>
   <releases>
-    <release version="@version@" type="development" date="2026-09-09">
+    <release version="@version@" type="development" date="2026-09-14">
+      <description>
+        <p>
+          Third 1.0 release candidate. Soft archive, trash, move, and flags
+          stay local until the sync timer, F5, startup, or quit, with an
+          on-disk mutation registry so pending work survives a crash. Microsoft
+          365 Archive moves are bulk and fast again (Camel freeze around
+          transfer). Virtual Outbox for Send, Drafts autosave every two
+          minutes, and Flatpak ships a minimal Evolution + evolution-ews stack
+          for Graph mail in the sandbox.
+        </p>
+      </description>
+    </release>
+    <release version="1.0.0-rc.2" type="development" date="2026-09-09">
       <description>
         <p>
           Second 1.0 release candidate. Completes the German UI translation,

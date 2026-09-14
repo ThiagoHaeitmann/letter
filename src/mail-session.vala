@@ -17,14 +17,31 @@ public class Mail.MailSession : Camel.Session {
     private HashTable<string, FlagFlushJob> flag_flush_latest;
     private bool flag_flush_running;
     private GenericArray<TransferFlushJob> transfer_flush_queue;
+    private TransferFlushJob? transfer_flush_current;
+    private uint transfer_flush_done;
     private HashTable<string, uint> transfer_pending;
     private bool transfer_flush_running;
+    private bool flush_force;
+    /* Active move Graph call — cancelled when send preempts the flush. */
+    private Cancellable? transfer_op_cancellable;
     private HashTable<string, FolderWatch> folder_watches;
     private HashTable<string, int> prefetch_cursor;
+    /* M365 accounts whose Camel folder-tree already has TYPE_TRASH/JUNK. */
+    private HashTable<string, bool> m365_folder_types_ok;
     private bool camel_busy;
     private int high_refresh_waiters;
+    /* Outbound send must preempt archive/move flush — open-body must not. */
+    private int send_waiters;
+    /* Bumped when a priority waiter steals a stuck Camel lock so the old
+     * holder's leave_camel does not clear the new owner's busy flag. */
+    private uint camel_epoch;
+    private uint camel_owner_epoch;
+    private uint mutation_registry_save_source;
+    private bool mutation_registry_loaded;
 
-    public const uint PREFETCH_NETWORK_CHUNK = 4;
+    public delegate void QueuedMoveHideFunc (Account account, Folder from, string uid);
+
+    public const uint PREFETCH_NETWORK_CHUNK = 12;
 
     public bool header_sync_busy {
         get {
@@ -32,7 +49,15 @@ public class Mail.MailSession : Camel.Session {
         }
     }
 
+    public bool priority_camel_waiting {
+        get {
+            return this.high_refresh_waiters > 0;
+        }
+    }
+
     public signal void folder_changed (string account_key, string folder_name);
+    public signal void send_starting ();
+    public signal void send_finished ();
     public signal void message_sent (Account account, Message? sent);
     public signal void draft_saved (Account account, Message? draft);
     public signal void draft_removed (Account account, Folder folder, string uid);
@@ -75,6 +100,7 @@ public class Mail.MailSession : Camel.Session {
         this.transfer_pending = new HashTable<string, uint> (str_hash, str_equal);
         this.folder_watches = new HashTable<string, FolderWatch> (str_hash, str_equal);
         this.prefetch_cursor = new HashTable<string, int> (str_hash, str_equal);
+        this.m365_folder_types_ok = new HashTable<string, bool> (str_hash, str_equal);
     }
 
     public override void dispose () {
@@ -346,7 +372,21 @@ public class Mail.MailSession : Camel.Session {
         public Account account;
         public Folder folder;
         public GenericArray<string> uids;
+        /* True → Camel.Folder.synchronize(expunge=true): purge \Deleted (IMAP
+         * Empty Trash / hard-delete). False → flag upload only (SEEN/FLAGGED). */
+        public bool expunge;
     }
+
+    /* Graph accepts multi-UID moves; flush starts small and grows toward
+     * DEFAULT after clean successes (same for Archive as for Trash/custom). */
+    private const uint TRANSFER_CHUNK_DEFAULT = 25;
+    private const uint TRANSFER_CHUNK_START = 1;
+    private const uint TRANSFER_CHUNK_MIN = 1;
+    /* Small destinations (Trash) usually finish in seconds; large ones
+     * (Archive / big custom folders) often need longer on Graph. */
+    private const uint TRANSFER_CHUNK_TIMEOUT_SECS = 90;
+    private const uint TRANSFER_CHUNK_TIMEOUT_HEAVY_SECS = 180;
+    private const uint TRANSFER_DEST_PROBE_SECS = 12;
 
     private class TransferFlushJob {
         public Account account;
@@ -355,6 +395,33 @@ public class Mail.MailSession : Camel.Session {
         public GenericArray<string> uids;
         public GenericArray<Message>? messages;
         public bool delete_original;
+        public uint stall_rounds;
+        public uint chunk_size;
+        /* Non-zero: skip until Utils.sync_tick() passes this (heavy park). */
+        public int64 parked_until;
+        public uint park_count;
+    }
+
+    /* Archive/Junk destinations — used for longer Graph timeout and priority
+     * ordering only. Moves are not throttled to one UID or parked on success. */
+    private static bool folder_is_parkable_heavy (Folder folder) {
+        return folder.is_archive_mailbox || folder.kind == FolderKind.JUNK;
+    }
+
+    /* libcamelews / camel-m365 skips post-transfer refresh_info when dest is
+     * frozen — without this, Archive moves hang on a full 24k-folder sync. */
+    private static void freeze_folders_for_transfer (Camel.Folder source, Camel.Folder dest) {
+        source.freeze ();
+        dest.freeze ();
+    }
+
+    private static void thaw_folders_for_transfer (Camel.Folder source, Camel.Folder dest) {
+        dest.thaw ();
+        source.thaw ();
+    }
+
+    private static bool transfer_job_is_parked (TransferFlushJob job) {
+        return job.parked_until > 0 && job.parked_until > Utils.sync_tick ();
     }
 
     private static GenericArray<FolderNode> nodes_from_info (Camel.FolderInfo? info) {
@@ -551,7 +618,8 @@ public class Mail.MailSession : Camel.Session {
         Cancellable? cancellable = null,
         bool watch = false,
         GenericArray<Message>? previous = null,
-        bool high = false
+        bool high = false,
+        uint refresh_timeout_seconds = 0
     ) throws Error {
         if (cancellable != null && cancellable.is_cancelled ())
             throw new IOError.CANCELLED ("Cancelled");
@@ -562,8 +630,10 @@ public class Mail.MailSession : Camel.Session {
         if (watch)
             watch_camel_folder (account, folder, camel_folder);
 
-        if (refresh && !folder_has_pending_flags (account, folder)) {
-            yield refresh_folder_info (camel_folder, high);
+        if (refresh
+            && refresh_timeout_seconds != REFRESH_INFO_SKIP
+            && !folder_has_pending_flags (account, folder)) {
+            yield refresh_folder_info (camel_folder, high, cancellable, refresh_timeout_seconds);
         }
 
         if (cancellable != null && cancellable.is_cancelled ())
@@ -636,7 +706,8 @@ public class Mail.MailSession : Camel.Session {
         if (!folder_has_pending_flags (account, folder)) {
             yield refresh_folder_info (
                 camel_folder,
-                folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS
+                folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS,
+                null
             );
         }
         var messages = yield collect_messages (account, camel_folder, folder, null);
@@ -850,6 +921,24 @@ public class Mail.MailSession : Camel.Session {
             || name.has_prefix (root + "\\");
     }
 
+    /* Camel folder summary size (local SQLite / on-disk UIDs). Does not hit the
+     * network — used to detect Letter header-list caches that lag behind Camel. */
+    public async int local_uid_count (
+        Account account,
+        Folder folder,
+        Cancellable? cancellable = null
+    ) throws Error {
+        if (folder.is_virtual_view)
+            return 0;
+        var camel_folder = yield open_camel_folder (account, folder, cancellable);
+        yield enter_camel (false);
+        try {
+            return (int) folder_list_uids (camel_folder).length;
+        } finally {
+            leave_camel (false);
+        }
+    }
+
     public async bool remote_counts_differ (
         Account account,
         Folder folder,
@@ -863,7 +952,7 @@ public class Mail.MailSession : Camel.Session {
             return false;
 
         if (remote_total >= 0)
-            folder.total = remote_total;
+            folder.total = int.max (folder.total, remote_total);
         if (remote_unread >= 0)
             folder.unread = remote_unread;
 
@@ -878,22 +967,128 @@ public class Mail.MailSession : Camel.Session {
         if (high)
             this.high_refresh_waiters++;
 
+        var spins = 0;
         while (this.camel_busy || (!high && this.high_refresh_waiters > 0)) {
+            /* Do not steal from flush for open-body (can leave Graph mid-move
+             * and resurrect mail). Send may preempt after a short wait so
+             * outbound mail is not blocked behind a slow transfer flush. */
+            if (high && spins >= 100) {
+                var flush_holds = this.transfer_flush_running || this.flag_flush_running;
+                if (flush_holds && this.send_waiters > 0) {
+                    /* Ask the in-flight move to abort; flush pauses on send_waiters
+                     * between UIDs. Steal only if Graph ignores cancel. */
+                    if (this.transfer_op_cancellable != null
+                        && !this.transfer_op_cancellable.is_cancelled ()) {
+                        Utils.sync_log ("Camel lock: cancelling move so send can proceed");
+                        this.transfer_op_cancellable.cancel ();
+                    }
+                    if (spins >= 500) {
+                        Utils.sync_log ("Camel lock: send preempting local flush");
+                        this.camel_epoch++;
+                        this.camel_busy = false;
+                        break;
+                    }
+                    if (spins == 100 || spins % 100 == 0) {
+                        Utils.sync_log ("Camel lock: waiting for flush to yield to send");
+                    }
+                } else if (spins >= 1000) {
+                    if (flush_holds) {
+                        if (spins == 1000 || spins % 500 == 0) {
+                            Utils.sync_log ("Camel lock held by local flush — priority still waiting");
+                        }
+                    } else {
+                        Utils.sync_log ("Camel lock stuck — stealing for priority work (send/open)");
+                        this.camel_epoch++;
+                        this.camel_busy = false;
+                        break;
+                    }
+                }
+            }
             Timeout.add (high ? 20 : 80, enter_camel.callback);
             yield;
+            spins++;
         }
 
         this.camel_busy = true;
+        this.camel_owner_epoch = this.camel_epoch;
     }
 
     private void leave_camel (bool high) {
-        this.camel_busy = false;
+        if (this.camel_owner_epoch == this.camel_epoch)
+            this.camel_busy = false;
+        else
+            Utils.sync_log ("stale Camel leave ignored (lock was stolen)");
         if (high)
             this.high_refresh_waiters--;
     }
 
-    private async void refresh_folder_info (Camel.Folder camel_folder, bool high) {
+    /* Link parent cancel + a wall-clock timeout so Graph calls cannot hold Camel forever. */
+    private static Cancellable bound_cancellable (Cancellable? parent, uint seconds, out ulong parent_id, out uint timeout_id) {
+        var timed = new Cancellable ();
+        parent_id = 0;
+        if (parent != null) {
+            if (parent.is_cancelled ())
+                timed.cancel ();
+            else {
+                parent_id = parent.connect (() => {
+                    timed.cancel ();
+                });
+            }
+        }
+        timeout_id = Timeout.add_seconds (seconds, () => {
+            if (!timed.is_cancelled ()) {
+                Utils.sync_log ("Camel op timeout (%us) — cancelling".printf (seconds));
+                timed.cancel ();
+            }
+            return Source.REMOVE;
+        });
+        return timed;
+    }
+
+    private static void unbind_cancellable (Cancellable? parent, ulong parent_id, uint timeout_id) {
+        if (timeout_id != 0)
+            Source.remove (timeout_id);
+        if (parent != null && parent_id != 0)
+            parent.disconnect (parent_id);
+    }
+
+    /* 0 → default (HIGH 45s / LOW 90s). REFRESH_INFO_SKIP → merge Camel only. */
+    public const uint REFRESH_INFO_SKIP = uint.MAX;
+    public const uint REFRESH_INFO_BRIEF = 15;
+    public const uint REFRESH_INFO_NORMAL = 45;
+    public const uint REFRESH_INFO_FULL = 90;
+
+    private async void refresh_folder_info (
+        Camel.Folder camel_folder,
+        bool high,
+        Cancellable? cancellable = null,
+        uint timeout_seconds = 0
+    ) {
         yield enter_camel (high);
+        var timed = new Cancellable ();
+        ulong cancel_id = 0;
+        if (cancellable != null) {
+            if (cancellable.is_cancelled ()) {
+                timed.cancel ();
+            } else {
+                cancel_id = cancellable.connect (() => {
+                    timed.cancel ();
+                });
+            }
+        }
+        /* Graph refresh_info can hang indefinitely on some folders; bound it so
+         * send / open-body / Inbox checks can recover via preempt. Scout uses a
+         * shorter budget on warm bulk folders and widens only if drift remains. */
+        var seconds = timeout_seconds;
+        if (seconds == 0)
+            seconds = high ? REFRESH_INFO_NORMAL : REFRESH_INFO_FULL;
+        var timeout_id = Timeout.add_seconds (seconds, () => {
+            if (!timed.is_cancelled ()) {
+                Utils.sync_log ("Camel refresh_info timeout (%us) — cancelling".printf (seconds));
+                timed.cancel ();
+            }
+            return Source.REMOVE;
+        });
         try {
             var name = camel_folder.get_full_display_name () ?? camel_folder.get_full_name ();
             var t0 = Utils.sync_tick ();
@@ -901,16 +1096,24 @@ public class Mail.MailSession : Camel.Session {
              * clears the Graph delta cursor and forces a full folder walk
              * (minutes on Sent/Archive). Outlook keeps the cursor and only
              * asks for changes. Camel refresh_info already uses delta. */
-            yield camel_folder.refresh_info (high ? Priority.DEFAULT : Priority.LOW, null);
+            yield camel_folder.refresh_info (high ? Priority.DEFAULT : Priority.LOW, timed);
             Utils.sync_log ("Camel refresh_info “%s” %s %s".printf (
                 name,
                 high ? "HIGH" : "LOW",
                 Utils.sync_ms (t0)
             ));
         } catch (Error e) {
-            Utils.sync_log ("Camel refresh_info FAILED: %s".printf (e.message));
-            warning ("Could not refresh folder: %s", e.message);
+            if (e is IOError.CANCELLED)
+                Utils.sync_log ("Camel refresh_info CANCELLED");
+            else {
+                Utils.sync_log ("Camel refresh_info FAILED: %s".printf (e.message));
+                warning ("Could not refresh folder: %s", e.message);
+            }
         } finally {
+            if (timeout_id != 0)
+                Source.remove (timeout_id);
+            if (cancel_id != 0 && cancellable != null)
+                cancellable.disconnect (cancel_id);
             leave_camel (high);
         }
     }
@@ -918,12 +1121,13 @@ public class Mail.MailSession : Camel.Session {
     private async Camel.MimeMessage? fetch_camel_message (
         Camel.Folder camel_folder,
         string uid,
-        int io_priority
+        int io_priority,
+        Cancellable? cancellable = null
     ) throws Error {
         var high = io_priority < Priority.LOW;
         yield enter_camel (high);
         try {
-            return yield camel_folder.get_message (uid, io_priority, null);
+            return yield camel_folder.get_message (uid, io_priority, cancellable);
         } finally {
             leave_camel (high);
         }
@@ -1759,7 +1963,7 @@ public class Mail.MailSession : Camel.Session {
         if (mime == null) {
             Utils.sync_log ("open body “%s” uid=%s from server".printf (folder.name, uid));
             try {
-                mime = yield fetch_camel_message (camel_folder, uid, Priority.DEFAULT);
+                mime = yield fetch_camel_message (camel_folder, uid, Priority.DEFAULT, cancellable);
             } catch (Error e) {
                 mime = message_from_local_cache (camel_folder, uid);
                 if (mime == null) {
@@ -1834,12 +2038,10 @@ public class Mail.MailSession : Camel.Session {
         int days,
         Cancellable? cancellable = null
     ) throws Error {
-        if (folder.kind == FolderKind.JUNK || folder.kind == FolderKind.TRASH)
-            return 0;
-
         int64 cutoff = body_cache_cutoff (days);
         var camel_folder = yield open_camel_folder (account, folder, null);
         var cursor_key = prefetch_cursor_key (account, folder);
+        ensure_prefetch_cursors_loaded ();
         int start = 0;
         if (this.prefetch_cursor.contains (cursor_key))
             start = this.prefetch_cursor.get (cursor_key);
@@ -1873,12 +2075,15 @@ public class Mail.MailSession : Camel.Session {
 
             try {
                 yield enter_camel (false);
+                ulong parent_id = 0;
+                uint timeout_id = 0;
+                var timed = bound_cancellable (cancellable, 45, out parent_id, out timeout_id);
                 try {
-                    /* Downloads to Camel’s on-disk cache and drops the in-memory
-                     * MimeMessage inside Camel — unlike get_message() to Vala. */
-                    yield camel_folder.synchronize_message (message.uid, Priority.LOW, cancellable);
+                    /* Full MIME (body + attachments) into Camel’s on-disk cache. */
+                    yield camel_folder.synchronize_message (message.uid, Priority.LOW, timed);
                     stored++;
                 } finally {
+                    unbind_cancellable (cancellable, parent_id, timeout_id);
                     leave_camel (false);
                 }
             } catch (Error e) {
@@ -1886,37 +2091,56 @@ public class Mail.MailSession : Camel.Session {
                     throw e;
             }
 
+            /* Let send / Inbox refresh take Camel before the next download. */
+            if (this.high_refresh_waiters > 0)
+                break;
+
             Idle.add (prefetch_recent.callback);
             yield;
         }
 
         var reached_end = i >= (int) listed.length
             || (cutoff > 0 && i < (int) listed.length && listed[i].date > 0 && listed[i].date < cutoff);
-        this.prefetch_cursor.set (cursor_key, reached_end ? 0 : i);
+        /* If we paused for a high-priority waiter, resume later from here. */
+        var paused_for_priority = this.high_refresh_waiters > 0 && !reached_end
+            && (cancellable == null || !cancellable.is_cancelled ());
+        var next_cursor = reached_end ? 0 : i;
+        this.prefetch_cursor.set (cursor_key, next_cursor);
+        schedule_prefetch_cursor_save ();
 
-        if (stored > 0 || skipped_disk > 0) {
-            Utils.sync_log ("prefetch “%s” done %s from-server=%u skipped-disk=%u cursor=%d/%u".printf (
+        if (stored > 0 || skipped_disk > 0 || start > 0) {
+            Utils.sync_log ("prefetch “%s” done %s from-server=%u skipped-disk=%u cursor=%d/%u%s".printf (
                 folder.name,
                 Utils.sync_ms (t0),
                 stored,
                 skipped_disk,
-                reached_end ? 0 : i,
-                listed.length
+                next_cursor,
+                listed.length,
+                paused_for_priority ? " (paused for priority)" : (reached_end ? " (window complete)" : "")
             ));
         }
 
         /* Camel/SQLite and glibc keep arenas warm across thousands of MIME parses. */
         Camel.DB.release_cache_memory ();
         trim_process_heap ();
+        /* Signal caller to requeue when more work remains (chunk full or paused). */
+        if (paused_for_priority && stored < PREFETCH_NETWORK_CHUNK)
+            return PREFETCH_NETWORK_CHUNK;
         return stored;
     }
 
     public void reset_prefetch_progress (Account? account = null) {
+        ensure_prefetch_cursors_loaded ();
         if (account == null) {
             this.prefetch_cursor.remove_all ();
+            delete_prefetch_cursor_file ();
             return;
         }
-        var prefix = "%s\n".printf (account.source_uid ?? account.uid);
+        var account_safe = Checksum.compute_for_string (
+            ChecksumType.SHA256,
+            account.source_uid ?? account.uid
+        );
+        var prefix = account_safe + ":";
         var keys = new GenericArray<string> ();
         this.prefetch_cursor.foreach ((key, value) => {
             if (key.has_prefix (prefix))
@@ -1924,10 +2148,93 @@ public class Mail.MailSession : Camel.Session {
         });
         for (uint i = 0; i < keys.length; i++)
             this.prefetch_cursor.remove (keys[i]);
+        schedule_prefetch_cursor_save ();
     }
 
     private static string prefetch_cursor_key (Account account, Folder folder) {
-        return "%s\n%s".printf (account.source_uid ?? account.uid, folder.full_name);
+        var account_id = account.source_uid ?? account.uid;
+        var account_safe = Checksum.compute_for_string (ChecksumType.SHA256, account_id);
+        var folder_safe = Checksum.compute_for_string (ChecksumType.SHA256, folder.full_name);
+        return "%s:%s".printf (account_safe, folder_safe);
+    }
+
+    public static string prefetch_cursor_cache_dir () {
+        return Path.build_filename (Environment.get_user_cache_dir (), "letter", "prefetch-cursors");
+    }
+
+    public static string prefetch_cursor_cache_file () {
+        return Path.build_filename (prefetch_cursor_cache_dir (), "cursors");
+    }
+
+    private bool prefetch_cursors_loaded = false;
+    private uint prefetch_cursor_save_source = 0;
+
+    private void ensure_prefetch_cursors_loaded () {
+        if (this.prefetch_cursors_loaded)
+            return;
+        this.prefetch_cursors_loaded = true;
+        var path = prefetch_cursor_cache_file ();
+        if (!FileUtils.test (path, FileTest.IS_REGULAR))
+            return;
+        try {
+            var key = new KeyFile ();
+            key.load_from_file (path, KeyFileFlags.NONE);
+            if (!key.has_group ("cursors"))
+                return;
+            foreach (var entry in key.get_keys ("cursors"))
+                this.prefetch_cursor.set (entry, key.get_integer ("cursors", entry));
+        } catch (Error e) {
+            debug ("Could not read prefetch cursors: %s", e.message);
+        }
+    }
+
+    private void schedule_prefetch_cursor_save () {
+        if (this.prefetch_cursor_save_source != 0)
+            return;
+        this.prefetch_cursor_save_source = Timeout.add (1500, () => {
+            this.prefetch_cursor_save_source = 0;
+            save_prefetch_cursors ();
+            return Source.REMOVE;
+        });
+    }
+
+    public void flush_prefetch_progress () {
+        if (this.prefetch_cursor_save_source != 0) {
+            Source.remove (this.prefetch_cursor_save_source);
+            this.prefetch_cursor_save_source = 0;
+        }
+        if (this.prefetch_cursors_loaded)
+            save_prefetch_cursors ();
+    }
+
+    private void save_prefetch_cursors () {
+        try {
+            File.new_for_path (prefetch_cursor_cache_dir ()).make_directory_with_parents ();
+        } catch (Error e) {
+            if (!(e is IOError.EXISTS)) {
+                debug ("Could not create prefetch cursor dir: %s", e.message);
+                return;
+            }
+        }
+
+        var key = new KeyFile ();
+        this.prefetch_cursor.foreach ((cursor_key, value) => {
+            key.set_integer ("cursors", cursor_key, value);
+        });
+        try {
+            key.save_to_file (prefetch_cursor_cache_file ());
+        } catch (Error e) {
+            debug ("Could not write prefetch cursors: %s", e.message);
+        }
+    }
+
+    private static void delete_prefetch_cursor_file () {
+        try {
+            File.new_for_path (prefetch_cursor_cache_file ()).delete ();
+        } catch (Error e) {
+            if (!(e is IOError.NOT_FOUND))
+                debug ("Could not delete prefetch cursors: %s", e.message);
+        }
     }
 
     private static bool message_body_file_exists (Camel.Folder camel_folder, string uid) {
@@ -1955,7 +2262,7 @@ public class Mail.MailSession : Camel.Session {
         int days,
         Cancellable? cancellable = null
     ) throws Error {
-        if (days <= 0 || folder.kind == FolderKind.JUNK || folder.kind == FolderKind.TRASH)
+        if (days <= 0)
             return 0;
 
         var cutoff = body_cache_cutoff (days);
@@ -2057,7 +2364,18 @@ public class Mail.MailSession : Camel.Session {
 #endif
         yield enter_camel (true);
         try {
-            yield source_folder.transfer_messages_to (uids, dest_folder, true, Priority.DEFAULT, cancellable, out transferred);
+            freeze_folders_for_transfer (source_folder, dest_folder);
+            try {
+                var xfer_t0 = Utils.sync_tick ();
+                yield source_folder.transfer_messages_to (uids, dest_folder, true, Priority.DEFAULT, cancellable, out transferred);
+                Utils.sync_log ("move Graph transfer “%s” → “%s” 1 uid %s".printf (
+                    from.name,
+                    destination.name,
+                    Utils.sync_ms (xfer_t0)
+                ));
+            } finally {
+                thaw_folders_for_transfer (source_folder, dest_folder);
+            }
         } finally {
             leave_camel (true);
         }
@@ -2082,7 +2400,18 @@ public class Mail.MailSession : Camel.Session {
 #endif
         yield enter_camel (true);
         try {
-            yield source_folder.transfer_messages_to (uids, dest_folder, false, Priority.DEFAULT, cancellable, out transferred);
+            freeze_folders_for_transfer (source_folder, dest_folder);
+            try {
+                var xfer_t0 = Utils.sync_tick ();
+                yield source_folder.transfer_messages_to (uids, dest_folder, false, Priority.DEFAULT, cancellable, out transferred);
+                Utils.sync_log ("copy Graph transfer “%s” → “%s” 1 uid %s".printf (
+                    from.name,
+                    destination.name,
+                    Utils.sync_ms (xfer_t0)
+                ));
+            } finally {
+                thaw_folders_for_transfer (source_folder, dest_folder);
+            }
         } finally {
             leave_camel (true);
         }
@@ -2104,6 +2433,33 @@ public class Mail.MailSession : Camel.Session {
         if (uids.length == 0)
             return;
 
+        /* Merge into the in-flight job or a queued same-route job so 30
+         * archives stay one Graph workload, not N serial jobs. */
+        if (this.transfer_flush_current != null
+            && transfer_jobs_mergeable (this.transfer_flush_current, account, from, destination, true)) {
+            merge_transfer_uids (this.transfer_flush_current, uids, messages);
+            Utils.sync_log ("move flush merged “%s” → “%s” now %u messages".printf (
+                from.name,
+                destination.name,
+                this.transfer_flush_current.uids.length
+            ));
+            schedule_mutation_registry_save ();
+            return;
+        }
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var existing = this.transfer_flush_queue[i];
+            if (!transfer_jobs_mergeable (existing, account, from, destination, true))
+                continue;
+            merge_transfer_uids (existing, uids, messages);
+            Utils.sync_log ("move flush merged “%s” → “%s” now %u messages".printf (
+                from.name,
+                destination.name,
+                existing.uids.length
+            ));
+            schedule_mutation_registry_save ();
+            return;
+        }
+
         var job = new TransferFlushJob () {
             account = account,
             from = from,
@@ -2111,6 +2467,7 @@ public class Mail.MailSession : Camel.Session {
             uids = uids,
             messages = messages,
             delete_original = true,
+            chunk_size = TRANSFER_CHUNK_START,
         };
         bump_transfer_pending (account, from, 1);
         if (from.full_name != destination.full_name)
@@ -2121,6 +2478,61 @@ public class Mail.MailSession : Camel.Session {
             destination.name,
             uids.length
         ));
+        schedule_mutation_registry_save ();
+    }
+
+    /* Drop UIDs from a queued (not yet flushing) move — used by Undo. */
+    public void cancel_queued_moves (
+        Account account,
+        Folder from,
+        Folder destination,
+        GenericArray<string> uids,
+        bool delete_original = true
+    ) {
+        if (uids.length == 0)
+            return;
+
+        var drop = new HashTable<string, uint8> (str_hash, str_equal);
+        for (uint i = 0; i < uids.length; i++)
+            drop.set (uids[i], 1);
+
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var job = this.transfer_flush_queue[i];
+            if (!transfer_jobs_mergeable (job, account, from, destination, delete_original))
+                continue;
+
+            var kept_uids = new GenericArray<string> ();
+            GenericArray<Message>? kept_messages = null;
+            if (job.messages != null)
+                kept_messages = new GenericArray<Message> ();
+            for (uint u = 0; u < job.uids.length; u++) {
+                if (drop.contains (job.uids[u]))
+                    continue;
+                kept_uids.add (job.uids[u]);
+                if (kept_messages != null && job.messages != null && u < job.messages.length)
+                    kept_messages.add (job.messages[u]);
+            }
+            if (kept_uids.length == job.uids.length)
+                return;
+
+            if (kept_uids.length == 0) {
+                this.transfer_flush_queue.remove_index (i);
+                bump_transfer_pending (account, from, -1);
+                if (from.full_name != destination.full_name)
+                    bump_transfer_pending (account, destination, -1);
+                Utils.sync_log ("move flush cancelled “%s” → “%s”".printf (from.name, destination.name));
+            } else {
+                job.uids = kept_uids;
+                job.messages = kept_messages;
+                Utils.sync_log ("move flush undo trimmed “%s” → “%s” now %u".printf (
+                    from.name,
+                    destination.name,
+                    kept_uids.length
+                ));
+            }
+            schedule_mutation_registry_save ();
+            return;
+        }
     }
 
     /* Copy without removing from source (Gmail Important label). Deferred like moves. */
@@ -2134,6 +2546,31 @@ public class Mail.MailSession : Camel.Session {
         if (uids.length == 0)
             return;
 
+        if (this.transfer_flush_current != null
+            && transfer_jobs_mergeable (this.transfer_flush_current, account, from, destination, false)) {
+            merge_transfer_uids (this.transfer_flush_current, uids, messages);
+            Utils.sync_log ("copy flush merged “%s” → “%s” now %u messages".printf (
+                from.name,
+                destination.name,
+                this.transfer_flush_current.uids.length
+            ));
+            schedule_mutation_registry_save ();
+            return;
+        }
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var existing = this.transfer_flush_queue[i];
+            if (!transfer_jobs_mergeable (existing, account, from, destination, false))
+                continue;
+            merge_transfer_uids (existing, uids, messages);
+            Utils.sync_log ("copy flush merged “%s” → “%s” now %u messages".printf (
+                from.name,
+                destination.name,
+                existing.uids.length
+            ));
+            schedule_mutation_registry_save ();
+            return;
+        }
+
         var job = new TransferFlushJob () {
             account = account,
             from = from,
@@ -2141,6 +2578,7 @@ public class Mail.MailSession : Camel.Session {
             uids = uids,
             messages = messages,
             delete_original = false,
+            chunk_size = TRANSFER_CHUNK_START,
         };
         bump_transfer_pending (account, from, 1);
         if (from.full_name != destination.full_name)
@@ -2151,16 +2589,625 @@ public class Mail.MailSession : Camel.Session {
             destination.name,
             uids.length
         ));
+        schedule_mutation_registry_save ();
     }
 
-    /* Push deferred flag/move/copy jobs (call from sync-interval / manual refresh). */
+    private static bool transfer_jobs_mergeable (
+        TransferFlushJob existing,
+        Account account,
+        Folder from,
+        Folder destination,
+        bool delete_original
+    ) {
+        if (existing.delete_original != delete_original)
+            return false;
+        if ((existing.account.source_uid ?? existing.account.uid)
+            != (account.source_uid ?? account.uid))
+            return false;
+        if (existing.from.full_name != from.full_name)
+            return false;
+        if (existing.destination.full_name != destination.full_name)
+            return false;
+        return true;
+    }
+
+    private static void merge_transfer_uids (
+        TransferFlushJob job,
+        GenericArray<string> uids,
+        GenericArray<Message>? messages
+    ) {
+        /* New UIDs on a parked route should be eligible on the next wave. */
+        job.parked_until = 0;
+        var seen = new HashTable<string, uint8> (str_hash, str_equal);
+        for (uint i = 0; i < job.uids.length; i++)
+            seen.set (job.uids[i], 1);
+        for (uint i = 0; i < uids.length; i++) {
+            if (seen.contains (uids[i]))
+                continue;
+            seen.set (uids[i], 1);
+            job.uids.add (uids[i]);
+            if (messages != null && i < messages.length) {
+                if (job.messages == null)
+                    job.messages = new GenericArray<Message> ();
+                job.messages.add (messages[i]);
+            }
+        }
+    }
+
+    public uint pending_transfer_count {
+        get {
+            uint n = 0;
+            for (uint i = 0; i < this.transfer_flush_queue.length; i++)
+                n += this.transfer_flush_queue[i].uids.length;
+            if (this.transfer_flush_current != null
+                && this.transfer_flush_done < this.transfer_flush_current.uids.length)
+                n += this.transfer_flush_current.uids.length - this.transfer_flush_done;
+            return n;
+        }
+    }
+
+    public uint pending_transfer_jobs {
+        get {
+            return this.transfer_flush_queue.length
+                + (this.transfer_flush_current != null ? 1u : 0u);
+        }
+    }
+
+    /* Push deferred flag/move/copy jobs (sync-interval / F5 / quit / startup).
+     * Flag and transfer pumps run independently so a parked Archive move does
+     * not stall SEEN / Trash. */
     public void flush_pending_local_changes () {
+        clear_expired_transfer_parks ();
         if (this.flag_flush_queue.length > 0)
             Utils.sync_log ("flushing deferred flags (%u queue)".printf (this.flag_flush_queue.length));
-        if (this.transfer_flush_queue.length > 0)
-            Utils.sync_log ("flushing deferred transfers (%u queue)".printf (this.transfer_flush_queue.length));
+        if (this.transfer_flush_queue.length > 0
+            || this.transfer_flush_current != null)
+            Utils.sync_log ("flushing deferred transfers (%u queue)".printf (
+                this.transfer_flush_queue.length
+                + (this.transfer_flush_current != null ? 1u : 0u)
+            ));
         pump_flag_flush.begin ();
         pump_transfer_flush.begin ();
+    }
+
+    public bool has_queued_mutations () {
+        return this.transfer_flush_queue.length > 0
+            || this.transfer_flush_current != null
+            || this.flag_flush_queue.length > 0
+            || this.flag_flush_latest.size () > 0;
+    }
+
+    /* True when flags or non-parked transfers still need Camel before Inbox
+     * refresh. Parked heavy Archive jobs must not defer mail-check. */
+    public bool has_blocking_local_flushes () {
+        if (this.flag_flush_running
+            || this.flag_flush_queue.length > 0
+            || this.flag_flush_latest.size () > 0)
+            return true;
+        if (this.transfer_flush_running)
+            return true;
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            if (!transfer_job_is_parked (this.transfer_flush_queue[i]))
+                return true;
+        }
+        return false;
+    }
+
+    private void clear_expired_transfer_parks () {
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var job = this.transfer_flush_queue[i];
+            if (job.parked_until > 0 && job.parked_until <= Utils.sync_tick ()) {
+                Utils.sync_log ("move flush park expired “%s” → “%s” (%u uids)".printf (
+                    job.from.name,
+                    job.destination.name,
+                    job.uids.length
+                ));
+                job.parked_until = 0;
+            }
+        }
+    }
+
+    /* Clear leftover parks so the next flush wave can drain moves. */
+    public void unpark_heavy_transfers () {
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var job = this.transfer_flush_queue[i];
+            if (job.parked_until <= 0)
+                continue;
+            job.parked_until = 0;
+            Utils.sync_log ("move flush unpark “%s” → “%s” (%u uids)".printf (
+                job.from.name,
+                job.destination.name,
+                job.uids.length
+            ));
+        }
+    }
+
+    /* Drain the soft-mutation registry, waiting up to @seconds. Returns true
+     * when the queues are empty. On timeout the on-disk registry is kept. */
+    public async bool flush_pending_local_changes_with_timeout (uint seconds) {
+        if (!has_queued_mutations ()) {
+            clear_mutation_registry_file ();
+            return true;
+        }
+
+        this.flush_force = true;
+        unpark_heavy_transfers ();
+        flush_pending_local_changes ();
+        var deadline = Utils.sync_tick () + (int64) seconds * TimeSpan.SECOND;
+        while (has_queued_mutations () || this.flag_flush_running || this.transfer_flush_running) {
+            if (Utils.sync_tick () >= deadline) {
+                Utils.sync_log ("mutation registry flush timed out after %us — keeping disk file".printf (seconds));
+                persist_mutation_registry_now ();
+                return false;
+            }
+            Timeout.add (100, flush_pending_local_changes_with_timeout.callback);
+            yield;
+        }
+        clear_mutation_registry_file ();
+        Utils.sync_log ("mutation registry flush ok");
+        return true;
+    }
+
+    public static string mutation_registry_dir () {
+        return Path.build_filename (Environment.get_user_data_dir (), "letter", "mutation-registry");
+    }
+
+    public static string mutation_registry_file () {
+        return Path.build_filename (mutation_registry_dir (), "pending");
+    }
+
+    public void schedule_mutation_registry_save () {
+        /* Restart the debounce so the last in-flight snapshot wins — otherwise
+         * a mid-flush save (e.g. 5/7 left) can stick on disk after the job
+         * finishes and nothing schedules a clear. */
+        if (this.mutation_registry_save_source != 0)
+            Source.remove (this.mutation_registry_save_source);
+        this.mutation_registry_save_source = Timeout.add (400, () => {
+            this.mutation_registry_save_source = 0;
+            persist_mutation_registry_now ();
+            return Source.REMOVE;
+        });
+    }
+
+    public void persist_mutation_registry_now () {
+        if (this.mutation_registry_save_source != 0) {
+            Source.remove (this.mutation_registry_save_source);
+            this.mutation_registry_save_source = 0;
+        }
+        if (!has_queued_mutations ()) {
+            clear_mutation_registry_file ();
+            return;
+        }
+
+        try {
+            File.new_for_path (mutation_registry_dir ()).make_directory_with_parents ();
+        } catch (Error e) {
+            if (!(e is IOError.EXISTS)) {
+                warning ("Could not create mutation registry dir: %s", e.message);
+                return;
+            }
+        }
+
+        var key = new KeyFile ();
+        key.set_integer ("meta", "version", 1);
+        uint transfer_n = 0;
+        if (this.transfer_flush_current != null
+            && this.transfer_flush_done < this.transfer_flush_current.uids.length) {
+            write_transfer_job_to_keyfile (key, "transfer-%u".printf (transfer_n),
+                this.transfer_flush_current, this.transfer_flush_done);
+            transfer_n++;
+        }
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var job = this.transfer_flush_queue[i];
+            if (job.uids.length == 0)
+                continue;
+            write_transfer_job_to_keyfile (key, "transfer-%u".printf (transfer_n),
+                job, 0);
+            transfer_n++;
+        }
+        key.set_integer ("meta", "transfers", (int) transfer_n);
+
+        uint flag_n = 0;
+        var seen_flag = new HashTable<string, uint8> (str_hash, str_equal);
+        for (uint i = 0; i < this.flag_flush_queue.length; i++) {
+            var job = this.flag_flush_queue[i];
+            var fk = flag_flush_key (job.account, job.folder);
+            if (this.flag_flush_latest.get (fk) != job)
+                continue;
+            if (seen_flag.contains (fk))
+                continue;
+            seen_flag.set (fk, 1);
+            write_flag_job_to_keyfile (key, "flag-%u".printf (flag_n), job);
+            flag_n++;
+        }
+        key.set_integer ("meta", "flags", (int) flag_n);
+
+        if (transfer_n == 0 && flag_n == 0) {
+            clear_mutation_registry_file ();
+            return;
+        }
+
+        try {
+            key.save_to_file (mutation_registry_file ());
+            Utils.sync_log ("mutation registry saved (%u transfers, %u flags)".printf (transfer_n, flag_n));
+        } catch (Error e) {
+            warning ("Could not write mutation registry: %s", e.message);
+        }
+    }
+
+    private static void write_transfer_job_to_keyfile (
+        KeyFile key,
+        string group,
+        TransferFlushJob job,
+        uint from_index
+    ) {
+        var account_id = job.account.source_uid ?? job.account.uid;
+        key.set_string (group, "account", account_id);
+        key.set_string (group, "from", job.from.full_name);
+        key.set_string (group, "from_name", job.from.name);
+        key.set_string (group, "destination", job.destination.full_name);
+        key.set_string (group, "destination_name", job.destination.name);
+        key.set_boolean (group, "delete_original", job.delete_original);
+        key.set_integer (group, "chunk_size", (int) (job.chunk_size > 0 ? job.chunk_size : TRANSFER_CHUNK_START));
+        var uids = new string[0];
+        for (uint i = from_index; i < job.uids.length; i++)
+            uids += job.uids[i];
+        key.set_string_list (group, "uids", uids);
+    }
+
+    private static void write_flag_job_to_keyfile (KeyFile key, string group, FlagFlushJob job) {
+        var account_id = job.account.source_uid ?? job.account.uid;
+        key.set_string (group, "account", account_id);
+        key.set_string (group, "folder", job.folder.full_name);
+        key.set_string (group, "folder_name", job.folder.name);
+        key.set_boolean (group, "expunge", job.expunge);
+        var uids = new string[job.uids.length];
+        for (uint i = 0; i < job.uids.length; i++)
+            uids[i] = job.uids[i];
+        key.set_string_list (group, "uids", uids);
+    }
+
+    private void clear_mutation_registry_file () {
+        var path = mutation_registry_file ();
+        if (!FileUtils.test (path, FileTest.IS_REGULAR))
+            return;
+        if (FileUtils.remove (path) == 0)
+            Utils.sync_log ("mutation registry cleared");
+        else
+            debug ("Could not remove mutation registry at %s", path);
+    }
+
+    /* Load soft moves/flags from disk into the in-memory queues. */
+    public uint load_mutation_registry () {
+        if (this.mutation_registry_loaded)
+            return 0;
+        this.mutation_registry_loaded = true;
+        var path = mutation_registry_file ();
+        if (!FileUtils.test (path, FileTest.IS_REGULAR))
+            return 0;
+
+        KeyFile key;
+        try {
+            key = new KeyFile ();
+            key.load_from_file (path, KeyFileFlags.NONE);
+        } catch (Error e) {
+            warning ("Could not read mutation registry: %s", e.message);
+            return 0;
+        }
+
+        uint loaded = 0;
+        try {
+            var transfer_n = key.has_group ("meta") ? key.get_integer ("meta", "transfers") : 0;
+            for (int i = 0; i < transfer_n; i++) {
+                var group = "transfer-%d".printf (i);
+                if (!key.has_group (group))
+                    continue;
+                var job = read_transfer_job_from_keyfile (key, group);
+                if (job == null || job.uids.length == 0)
+                    continue;
+                this.transfer_flush_queue.add (job);
+                bump_transfer_pending (job.account, job.from, 1);
+                if (job.from.full_name != job.destination.full_name)
+                    bump_transfer_pending (job.account, job.destination, 1);
+                loaded++;
+            }
+            var flag_n = key.has_group ("meta") ? key.get_integer ("meta", "flags") : 0;
+            for (int i = 0; i < flag_n; i++) {
+                var group = "flag-%d".printf (i);
+                if (!key.has_group (group))
+                    continue;
+                var job = read_flag_job_from_keyfile (key, group);
+                if (job == null || job.uids.length == 0)
+                    continue;
+                var fk = flag_flush_key (job.account, job.folder);
+                this.flag_flush_latest.set (fk, job);
+                this.flag_flush_queue.add (job);
+                loaded++;
+            }
+        } catch (Error e) {
+            warning ("Could not parse mutation registry: %s", e.message);
+        }
+
+        if (loaded > 0)
+            Utils.sync_log ("mutation registry loaded (%u jobs)".printf (loaded));
+        return loaded;
+    }
+
+    private TransferFlushJob? read_transfer_job_from_keyfile (KeyFile key, string group) throws Error {
+        var account = account_from_source_uid (key.get_string (group, "account"));
+        if (account == null)
+            return null;
+        var from = folder_stub (key.get_string (group, "from"),
+            key.has_key (group, "from_name") ? key.get_string (group, "from_name") : null);
+        var destination = folder_stub (key.get_string (group, "destination"),
+            key.has_key (group, "destination_name") ? key.get_string (group, "destination_name") : null);
+        var uids = new GenericArray<string> ();
+        foreach (var uid in key.get_string_list (group, "uids")) {
+            if (uid != null && uid.length > 0)
+                uids.add (uid);
+        }
+        return new TransferFlushJob () {
+            account = account,
+            from = from,
+            destination = destination,
+            uids = uids,
+            messages = null,
+            delete_original = key.get_boolean (group, "delete_original"),
+            chunk_size = (uint) int.max (1, key.get_integer (group, "chunk_size")),
+        };
+    }
+
+    private FlagFlushJob? read_flag_job_from_keyfile (KeyFile key, string group) throws Error {
+        var account = account_from_source_uid (key.get_string (group, "account"));
+        if (account == null)
+            return null;
+        var folder = folder_stub (key.get_string (group, "folder"),
+            key.has_key (group, "folder_name") ? key.get_string (group, "folder_name") : null);
+        var uids = new GenericArray<string> ();
+        foreach (var uid in key.get_string_list (group, "uids")) {
+            if (uid != null && uid.length > 0)
+                uids.add (uid);
+        }
+        return new FlagFlushJob () {
+            account = account,
+            folder = folder,
+            uids = uids,
+            expunge = key.get_boolean (group, "expunge"),
+        };
+    }
+
+    private Account? account_from_source_uid (string uid) {
+        if (uid.length == 0)
+            return null;
+        var source = this.registry.ref_source (uid);
+        if (source == null || !source.has_extension (E.SOURCE_EXTENSION_MAIL_ACCOUNT))
+            return null;
+        var mail_account = (E.SourceMailAccount) source.get_extension (E.SOURCE_EXTENSION_MAIL_ACCOUNT);
+        var backend_name = mail_account.dup_backend_name ();
+        return new Account () {
+            uid = uid,
+            source_uid = uid,
+            display_name = source.display_name ?? uid,
+            has_mail = true,
+            enabled = source.enabled,
+            backend_name = backend_name,
+            kind = AccountKind.from_provider (null, backend_name),
+        };
+    }
+
+    private static Folder folder_stub (string full_name, string? name) {
+        var folder = new Folder () {
+            full_name = full_name,
+            name = (name != null && name.length > 0) ? name : full_name,
+        };
+        apply_folder_display_name (folder);
+        return folder;
+    }
+
+    /* Walk queued soft-moves so the UI can re-hide source UIDs after restart. */
+    public void foreach_queued_move_hide (QueuedMoveHideFunc func) {
+        if (this.transfer_flush_current != null) {
+            var job = this.transfer_flush_current;
+            for (uint i = this.transfer_flush_done; i < job.uids.length; i++)
+                func (job.account, job.from, job.uids[i]);
+        }
+        for (uint j = 0; j < this.transfer_flush_queue.length; j++) {
+            var job = this.transfer_flush_queue[j];
+            for (uint i = 0; i < job.uids.length; i++)
+                func (job.account, job.from, job.uids[i]);
+        }
+    }
+
+    /* True while a flush worker is actually running — for status UI.
+     * Queued-but-idle jobs (waiting for the sync timer) must not light the bar. */
+    public bool has_active_local_flushes () {
+        return this.flag_flush_running
+            || this.transfer_flush_running
+            || this.transfer_flush_current != null;
+    }
+
+    public bool has_pending_local_flushes () {
+        return has_active_local_flushes ()
+            || this.transfer_pending.size () > 0
+            || this.flag_flush_latest.size () > 0;
+    }
+
+    /* Wait until blocking moves/flags reach the server before Inbox refresh,
+     * otherwise Camel still lists archived mail and Letter notifies them as new.
+     * Parked heavy Archive jobs do not block — they retry on the next wave. */
+    public async void flush_pending_local_changes_async () {
+        this.flush_force = true;
+        flush_pending_local_changes ();
+        var waited = 0;
+        while (has_blocking_local_flushes ()) {
+            if (waited == 0)
+                Utils.sync_log ("waiting for local flush before mail check");
+            waited++;
+            if (waited > 1200) {
+                /* Keep flush_force so moves stay high-priority; caller defers
+                 * Inbox refresh while blocking work remains. */
+                Utils.sync_log ("local flush wait timed out — keeping flush priority (%u transfers)".printf (
+                    this.transfer_flush_queue.length
+                ));
+                break;
+            }
+            Timeout.add (50, flush_pending_local_changes_async.callback);
+            yield;
+        }
+        if (waited > 0 && !has_blocking_local_flushes ()) {
+            Utils.sync_log ("local flush settled after %d ms".printf (waited * 50));
+            this.flush_force = false;
+        } else if (!has_blocking_local_flushes ()) {
+            this.flush_force = false;
+        }
+    }
+
+    /* Push DELETED flags then optionally Camel.Folder.expunge.
+     * synchronize(expunge=true) alone is a no-op on Microsoft 365 Graph.
+     * On Graph, Folder.expunge hard-deletes *every* UID in Trash — so selective
+     * deletes must synchronize only. Empty Trash still needs expunge.
+     * ErrorItemNotFound means Graph already dropped the item — treat as success. */
+    private async void push_deleted_and_expunge (
+        Camel.Folder camel_folder,
+        string folder_name,
+        uint count,
+        bool high,
+        bool do_expunge,
+        Cancellable? cancellable
+    ) throws Error {
+        yield enter_camel (high);
+        try {
+            var priority = high ? Priority.DEFAULT : Priority.LOW;
+            try {
+                yield camel_folder.synchronize (false, priority, cancellable);
+                if (do_expunge)
+                    yield camel_folder.expunge (priority, cancellable);
+            } catch (Error e) {
+                if (is_missing_on_server (e)) {
+                    Utils.sync_log ("purge “%s” %u messages — already gone on server".printf (
+                        folder_name,
+                        count
+                    ));
+                    return;
+                }
+                throw e;
+            }
+            Utils.sync_log ("purge “%s” %u messages (%s)".printf (
+                folder_name,
+                count,
+                do_expunge ? "sync+expunge" : "sync"
+            ));
+        } finally {
+            leave_camel (high);
+        }
+    }
+
+    /* evolution-ews only hard-deletes / resolves "deleteditems" when the Camel
+     * store summary has TYPE_TRASH (and TYPE_JUNK for Junk). Graph folder delta
+     * sometimes leaves those bits unset (Flags=NOCHILDREN only) — then expunge
+     * is a no-op and soft-delete cannot find Trash, so mail resurrects. */
+    private async void ensure_m365_folder_types (Account account) throws Error {
+        if (!backend_saves_sent_on_server (account))
+            return;
+        var uid = account.source_uid;
+        if (uid == null || uid.length == 0)
+            return;
+        if (this.m365_folder_types_ok.get (uid))
+            return;
+
+        var tree_path = Path.build_filename (mail_cache_root (), uid, "folder-tree");
+        if (!FileUtils.test (tree_path, FileTest.IS_REGULAR)) {
+            this.m365_folder_types_ok.set (uid, true);
+            return;
+        }
+
+        uint patched = 0;
+        try {
+            patched = patch_m365_folder_tree_types (tree_path);
+        } catch (Error e) {
+            warning ("Could not repair M365 folder types: %s", e.message);
+            return;
+        }
+
+        /* Always reload once per account/session so an already-patched
+         * folder-tree on disk replaces a stale in-memory summary (Flags
+         * without TYPE_TRASH make Graph purge a silent no-op). */
+        if (patched > 0)
+            Utils.sync_log ("repaired %u M365 special-folder type flag(s) — reloading store".printf (patched));
+        else
+            Utils.sync_log ("reloading M365 store to apply special-folder type flags");
+
+        unwatch_account_folders (uid);
+        var service = ref_service (uid);
+        if (service != null) {
+            try {
+                var offline = service as Camel.OfflineStore;
+                if (offline != null && offline.get_online ())
+                    yield offline.set_online (false, Priority.DEFAULT, null);
+                else if (service.get_connection_status () == Camel.ServiceConnectionStatus.CONNECTED)
+                    yield service.disconnect (true, Priority.DEFAULT, null);
+            } catch (Error e) {
+                debug ("Could not disconnect before M365 type reload: %s", e.message);
+            }
+            remove_service (service);
+        }
+        yield open_store (account, null, true);
+        this.m365_folder_types_ok.set (uid, true);
+    }
+
+    private static uint patch_m365_folder_tree_types (string tree_path) throws Error {
+        var key = new KeyFile ();
+        key.load_from_file (tree_path, KeyFileFlags.NONE);
+        var groups = key.get_groups ();
+        uint patched = 0;
+        foreach (unowned string group in groups) {
+            if (group.has_prefix ("#"))
+                continue;
+            if (!key.has_key (group, "DisplayName"))
+                continue;
+            var display = key.get_string (group, "DisplayName");
+            var kind = FolderKind.from_flags (0, display, display);
+            uint32 type_bit = 0;
+            switch (kind) {
+                case FolderKind.INBOX:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_INBOX;
+                    break;
+                case FolderKind.OUTBOX:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_OUTBOX;
+                    break;
+                case FolderKind.TRASH:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_TRASH;
+                    break;
+                case FolderKind.JUNK:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_JUNK;
+                    break;
+                case FolderKind.SENT:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_SENT;
+                    break;
+                case FolderKind.DRAFTS:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_DRAFTS;
+                    break;
+                case FolderKind.ARCHIVE:
+                case FolderKind.ALL:
+                    type_bit = (uint32) Camel.FolderInfoFlags.TYPE_ARCHIVE;
+                    break;
+                default:
+                    continue;
+            }
+
+            uint64 flags = 0;
+            if (key.has_key (group, "Flags"))
+                flags = key.get_uint64 (group, "Flags");
+            var mask = (uint64) Folder.TYPE_MASK;
+            if ((flags & mask) == type_bit)
+                continue;
+            flags = (flags & ~mask) | type_bit;
+            key.set_uint64 (group, "Flags", flags);
+            patched++;
+        }
+        if (patched > 0)
+            key.save_to_file (tree_path);
+        return patched;
     }
 
     public async void delete_message (Account account, Folder folder, string uid, Folder? trash, Cancellable? cancellable = null) throws Error {
@@ -2169,18 +3216,39 @@ public class Mail.MailSession : Camel.Session {
             return;
         }
 
+        yield ensure_m365_folder_types (account);
+        if (backend_saves_sent_on_server (account) && folder.kind == FolderKind.JUNK) {
+            var uids = new GenericArray<string> ();
+            uids.add (uid);
+            yield hard_delete_m365_junk (account, folder, uids, cancellable);
+            if (folder.kind == FolderKind.DRAFTS)
+                draft_removed (account, folder, uid);
+            return;
+        }
+
+        /* Hard-delete (already in Trash, Drafts after send, or no Trash). */
         var camel_folder = yield open_camel_folder (account, folder, cancellable);
         camel_folder.set_message_flags (uid, Camel.MessageFlags.DELETED, Camel.MessageFlags.DELETED);
+        drop_body (account, folder, uid);
         try {
-            yield enter_camel (true);
-            try {
-                yield camel_folder.synchronize_message (uid, Priority.DEFAULT, cancellable);
-            } finally {
-                leave_camel (true);
-            }
+            /* Graph Trash expunge wipes the whole folder — sync-only for one UID. */
+            var do_expunge = !backend_saves_sent_on_server (account)
+                || folder.kind != FolderKind.TRASH;
+            yield push_deleted_and_expunge (camel_folder, folder.name, 1, true, do_expunge, cancellable);
         } catch (Error e) {
             warning ("Could not expunge deleted message: %s", e.message);
+            throw e;
         }
+        apply_camel_counts (folder, camel_folder);
+        if (folder.kind == FolderKind.DRAFTS)
+            draft_removed (account, folder, uid);
+    }
+
+    /* Mark deleted in the local Camel store only — server push waits for the
+     * normal folder sync interval (draft autosave / replace must not hit Graph). */
+    public async void delete_message_local (Account account, Folder folder, string uid) throws Error {
+        var camel_folder = yield open_camel_folder (account, folder, null);
+        camel_folder.set_message_flags (uid, Camel.MessageFlags.DELETED, Camel.MessageFlags.DELETED);
         drop_body (account, folder, uid);
         apply_camel_counts (folder, camel_folder);
         if (folder.kind == FolderKind.DRAFTS)
@@ -2192,6 +3260,12 @@ public class Mail.MailSession : Camel.Session {
             return;
         if (trash != null && folder.full_name != trash.full_name) {
             enqueue_move_messages (account, folder, trash, uids, null);
+            return;
+        }
+
+        yield ensure_m365_folder_types (account);
+        if (backend_saves_sent_on_server (account) && folder.kind == FolderKind.JUNK) {
+            yield hard_delete_m365_junk (account, folder, uids, null);
             return;
         }
 
@@ -2210,13 +3284,17 @@ public class Mail.MailSession : Camel.Session {
             camel_folder.thaw ();
         }
         apply_camel_counts (folder, camel_folder);
-        enqueue_flag_flush (account, folder, uids);
+        /* Hard-delete: Graph Trash uses sync only (expunge = empty entire Trash). */
+        var do_expunge = !backend_saves_sent_on_server (account)
+            || folder.kind != FolderKind.TRASH;
+        yield push_deleted_and_expunge (camel_folder, folder.name, uids.length, true, do_expunge, null);
     }
 
     public async void empty_folder (Account account, Folder folder) throws Error {
         if (folder.is_virtual_view)
             return;
 
+        yield ensure_m365_folder_types (account);
         var camel_folder = yield open_camel_folder (account, folder, null);
         var raw = folder_list_uids (camel_folder);
         if (raw.length == 0) {
@@ -2225,7 +3303,14 @@ public class Mail.MailSession : Camel.Session {
             return;
         }
 
-        var uids = new GenericArray<string> ();
+        if (backend_saves_sent_on_server (account) && folder.kind == FolderKind.JUNK) {
+            yield hard_delete_m365_junk (account, folder, raw, null);
+            folder.unread = 0;
+            folder.total = 0;
+            Utils.sync_log ("empty “%s” %u messages done".printf (folder.name, raw.length));
+            return;
+        }
+
         camel_folder.freeze ();
         try {
             for (uint i = 0; i < raw.length; i++) {
@@ -2235,14 +3320,141 @@ public class Mail.MailSession : Camel.Session {
                     Camel.MessageFlags.DELETED
                 );
                 drop_body (account, folder, raw[i]);
-                uids.add (raw[i]);
             }
         } finally {
             camel_folder.thaw ();
         }
         folder.unread = 0;
         folder.total = 0;
-        enqueue_flag_flush (account, folder, uids);
+        /* Empty Trash: always expunge after sync (IMAP + Graph Trash). */
+        yield push_deleted_and_expunge (camel_folder, folder.name, raw.length, true, true, null);
+        Utils.sync_log ("empty “%s” %u messages done".printf (folder.name, raw.length));
+    }
+
+    /* Graph Junk: DELETED+sync only soft-moves to Trash; expunge is a no-op.
+     * Move into Trash then hard-delete there (sync without full-folder expunge). */
+    private async void hard_delete_m365_junk (
+        Account account,
+        Folder junk,
+        GenericArray<string> uids,
+        Cancellable? cancellable
+    ) throws Error {
+        if (uids.length == 0)
+            return;
+
+        var store = yield open_store (account, cancellable, true);
+        /* Prefer opening Trash by mailbox name. store.get_trash_folder() first
+         * synchronizes every open folder and refreshes Trash — that races the
+         * Junk purge and often surfaces ErrorItemNotFound toasts. */
+        Camel.Folder? trash_camel = null;
+        try {
+            var folders = yield list_folders (account, cancellable, false);
+            for (uint i = 0; i < folders.length; i++) {
+                if (folders[i].kind != FolderKind.TRASH)
+                    continue;
+                trash_camel = yield open_camel_folder (account, folders[i], cancellable);
+                break;
+            }
+        } catch (Error e) {
+            debug ("Could not open Trash by name for Junk purge: %s", e.message);
+        }
+        if (trash_camel == null) {
+            try {
+                trash_camel = yield store.get_trash_folder (Priority.DEFAULT, cancellable);
+            } catch (Error e) {
+                warning ("M365 Trash folder unavailable for Junk purge: %s", e.message);
+            }
+        }
+        if (trash_camel == null) {
+            throw new IOError.NOT_FOUND (
+                _("Could not locate Trash folder")
+            );
+        }
+
+        var junk_camel = yield open_camel_folder (account, junk, cancellable);
+#if HAVE_CAMEL_3_58
+        GenericArray<weak string>? transferred = null;
+#else
+        GenericArray<string>? transferred = null;
+#endif
+        yield enter_camel (true);
+        try {
+            freeze_folders_for_transfer (junk_camel, trash_camel);
+            try {
+                try {
+                    yield junk_camel.transfer_messages_to (
+                        uids,
+                        trash_camel,
+                        true,
+                        Priority.DEFAULT,
+                        cancellable,
+                        out transferred
+                    );
+                } catch (Error e) {
+                    /* Partial Graph batches often end with ErrorItemNotFound for
+                     * already-purged ids while the rest moved successfully. */
+                    if (!is_missing_on_server (e))
+                        throw e;
+                    Utils.sync_log ("Junk→Trash transfer reported missing items — continuing purge");
+                }
+            } finally {
+                thaw_folders_for_transfer (junk_camel, trash_camel);
+            }
+        } finally {
+            leave_camel (true);
+        }
+
+        var purge = new GenericArray<string> ();
+        if (transferred != null) {
+            for (uint i = 0; i < transferred.length; i++) {
+                if (transferred[i] != null && transferred[i].length > 0)
+                    purge.add (transferred[i]);
+            }
+        }
+        /* M365 often keeps the same Graph id across folders — purge those too. */
+        if (purge.length == 0) {
+            for (uint i = 0; i < uids.length; i++) {
+                if (trash_camel.get_message_info (uids[i]) != null)
+                    purge.add (uids[i]);
+            }
+        }
+        if (purge.length == 0) {
+            for (uint i = 0; i < uids.length; i++)
+                drop_body (account, junk, uids[i]);
+            apply_camel_counts (junk, junk_camel);
+            Utils.sync_log ("purge Junk “%s” %u messages (moved to Trash)".printf (junk.name, uids.length));
+            return;
+        }
+
+        trash_camel.freeze ();
+        try {
+            for (uint i = 0; i < purge.length; i++) {
+                trash_camel.set_message_flags (
+                    purge[i],
+                    Camel.MessageFlags.DELETED,
+                    Camel.MessageFlags.DELETED
+                );
+            }
+        } finally {
+            trash_camel.thaw ();
+        }
+        for (uint i = 0; i < uids.length; i++)
+            drop_body (account, junk, uids[i]);
+        try {
+            yield push_deleted_and_expunge (
+                trash_camel,
+                trash_camel.get_full_display_name () ?? trash_camel.get_display_name () ?? "Trash",
+                purge.length,
+                true,
+                false,
+                cancellable
+            );
+        } catch (Error e) {
+            if (!is_missing_on_server (e))
+                throw e;
+            Utils.sync_log ("purge Junk via Trash — already gone on server");
+        }
+        apply_camel_counts (junk, junk_camel);
     }
 
     public async void set_folder_seen (Account account, Folder folder, bool seen) throws Error {
@@ -2382,17 +3594,33 @@ public class Mail.MailSession : Camel.Session {
         return "%s\n%s".printf (account.source_uid ?? account.uid, folder.full_name);
     }
 
-    private void enqueue_flag_flush (Account account, Folder folder, GenericArray<string> uids) {
+    private void enqueue_flag_flush (
+        Account account,
+        Folder folder,
+        GenericArray<string> uids,
+        bool expunge = false
+    ) {
         var job = new FlagFlushJob () {
             account = account,
             folder = folder,
             uids = uids,
+            expunge = expunge,
         };
-        this.flag_flush_latest.set (flag_flush_key (account, folder), job);
+        /* If a prior job for this folder asked to expunge, keep that. */
+        var key = flag_flush_key (account, folder);
+        var prior = this.flag_flush_latest.get (key);
+        if (prior != null && prior.expunge)
+            job.expunge = true;
+        this.flag_flush_latest.set (key, job);
         this.flag_flush_queue.add (job);
-        /* Cache-first: local Camel flags are already set. Server push waits for
-         * sync-interval / manual refresh (flush_pending_local_changes). */
-        Utils.sync_log ("flag flush deferred “%s” %u messages".printf (folder.name, uids.length));
+        /* Local Camel flags are already set. SEEN/FLAGGED/DELETED wait for the
+         * sync timer or F5 (flush_pending_local_changes). */
+        Utils.sync_log ("flag flush deferred “%s” %u messages%s".printf (
+            folder.name,
+            uids.length,
+            expunge ? " (expunge)" : ""
+        ));
+        schedule_mutation_registry_save ();
     }
 
     private async void pump_flag_flush () {
@@ -2400,6 +3628,10 @@ public class Mail.MailSession : Camel.Session {
             return;
 
         this.flag_flush_running = true;
+        if (this.transfer_flush_running)
+            Utils.sync_log ("flag flush while transfer in flight (%u queue)".printf (
+                this.flag_flush_queue.length
+            ));
         try {
             while (this.flag_flush_queue.length > 0) {
                 var job = this.flag_flush_queue[0];
@@ -2411,6 +3643,7 @@ public class Mail.MailSession : Camel.Session {
             }
         } finally {
             this.flag_flush_running = false;
+            persist_mutation_registry_now ();
         }
     }
 
@@ -2423,6 +3656,7 @@ public class Mail.MailSession : Camel.Session {
             warning ("Could not push folder flags: %s", e.message);
             if (this.flag_flush_latest.get (key) == job)
                 this.flag_flush_latest.remove (key);
+            schedule_mutation_registry_save ();
             return;
         }
 
@@ -2433,7 +3667,9 @@ public class Mail.MailSession : Camel.Session {
             if (this.flag_flush_latest.get (key) != job)
                 return;
 
-            if (this.high_refresh_waiters > 0) {
+            /* While archive/move flush owns Camel, do not yield SEEN/flag pushes
+             * to open-body — that parked flag flush for minutes (180s+). */
+            if (this.high_refresh_waiters > 0 && !this.flush_force) {
                 if (!logged_pause) {
                     Utils.sync_log ("flag flush paused “%s” for user (%u/%u)".printf (
                         job.folder.name,
@@ -2448,24 +3684,39 @@ public class Mail.MailSession : Camel.Session {
             }
             logged_pause = false;
 
-            yield enter_camel (false);
+            /* Expunge jobs (Empty Trash / hard-delete) take HIGH so account
+             * switch / open-body do not starve the purge for minutes. */
+            var high = job.expunge;
             try {
-                /* synchronize_message only downloads bodies. Flag/follow-up/SEEN
-                 * uploads go through folder.synchronize → backend save_flags. */
-                yield camel_folder.synchronize (false, Priority.LOW, null);
+                if (job.expunge) {
+                    yield push_deleted_and_expunge (
+                        camel_folder,
+                        job.folder.name,
+                        job.uids.length,
+                        high,
+                        true,
+                        null
+                    );
+                } else {
+                    yield enter_camel (false);
+                    try {
+                        yield camel_folder.synchronize (false, Priority.LOW, null);
+                    } finally {
+                        leave_camel (false);
+                    }
+                }
                 done = job.uids.length;
             } catch (Error e) {
                 warning ("Could not push folder flags for “%s”: %s", job.folder.name, e.message);
                 done = job.uids.length;
-            } finally {
-                leave_camel (false);
             }
 
-            Utils.sync_log ("flag flush “%s” %u/%u %s".printf (
+            Utils.sync_log ("flag flush “%s” %u/%u %s%s".printf (
                 job.folder.name,
                 done,
                 job.uids.length,
-                Utils.sync_ms (t0)
+                Utils.sync_ms (t0),
+                job.expunge ? " (expunge)" : ""
             ));
 
             Idle.add (flush_folder_flags.callback);
@@ -2476,6 +3727,7 @@ public class Mail.MailSession : Camel.Session {
             return;
         apply_camel_counts (job.folder, camel_folder);
         this.flag_flush_latest.remove (key);
+        schedule_mutation_registry_save ();
     }
 
     private void bump_transfer_pending (Account account, Folder folder, int delta) {
@@ -2498,15 +3750,70 @@ public class Mail.MailSession : Camel.Session {
             return;
 
         this.transfer_flush_running = true;
+        this.flush_force = true;
+        clear_expired_transfer_parks ();
         try {
             while (this.transfer_flush_queue.length > 0) {
-                var job = this.transfer_flush_queue[0];
-                this.transfer_flush_queue.remove_index (0);
-                yield flush_folder_transfers (job);
+                var idx = pick_runnable_transfer_job_index ();
+                if (idx < 0) {
+                    Utils.sync_log ("move flush wave idle — %u job(s) left".printf (
+                        this.transfer_flush_queue.length
+                    ));
+                    break;
+                }
+                var job = this.transfer_flush_queue[(uint) idx];
+                this.transfer_flush_queue.remove_index ((uint) idx);
+                this.transfer_flush_current = job;
+                this.transfer_flush_done = 0;
+                try {
+                    yield flush_folder_transfers (job);
+                } finally {
+                    this.transfer_flush_current = null;
+                    this.transfer_flush_done = 0;
+                }
             }
         } finally {
             this.transfer_flush_running = false;
+            if (!has_blocking_local_flushes ())
+                this.flush_force = false;
+            /* Drop mid-flush snapshots (or clear) now that RAM matches reality. */
+            persist_mutation_registry_now ();
+            /* Flags often enqueue mid-move; keep the pump warm. */
+            pump_flag_flush.begin ();
         }
+    }
+
+    /* Prefer Trash/light, then Inbox→Archive (interactive), then bulk
+     * Archive-subtree reshuffles. Drain each job fully in this wave. */
+    private int pick_runnable_transfer_job_index () {
+        int light = -1;
+        int heavy_interactive = -1;
+        int heavy_bulk = -1;
+        for (uint i = 0; i < this.transfer_flush_queue.length; i++) {
+            var job = this.transfer_flush_queue[i];
+            if (transfer_job_is_parked (job))
+                continue;
+            if (folder_is_parkable_heavy (job.destination)) {
+                if (transfer_job_is_bulk_archive_source (job)) {
+                    if (heavy_bulk < 0)
+                        heavy_bulk = (int) i;
+                } else if (heavy_interactive < 0) {
+                    heavy_interactive = (int) i;
+                }
+            } else if (light < 0) {
+                light = (int) i;
+            }
+        }
+        if (light >= 0)
+            return light;
+        if (heavy_interactive >= 0)
+            return heavy_interactive;
+        return heavy_bulk;
+    }
+
+    /* Year folders / Archive children reshuffled into Archivio — deprioritize. */
+    private static bool transfer_job_is_bulk_archive_source (TransferFlushJob job) {
+        return job.from.is_archive_mailbox;
     }
 
     private async void flush_folder_transfers (TransferFlushJob job) {
@@ -2521,35 +3828,143 @@ public class Mail.MailSession : Camel.Session {
             return;
         }
 
-        const uint BATCH = 1;
+        /* Only drop UIDs already at the destination — never drop because Camel
+         * cleared the source summary after a cancelled Graph call. */
+        claim_uids_already_at_destination (job, dest_folder, 0);
+        if (job.uids.length == 0) {
+            Utils.sync_log ("move flush “%s” → “%s” nothing left to move".printf (
+                job.from.name,
+                job.destination.name
+            ));
+            bump_transfer_pending (job.account, job.from, -1);
+            if (job.from.full_name != job.destination.full_name)
+                bump_transfer_pending (job.account, job.destination, -1);
+            return;
+        }
+
+        if (job.chunk_size == 0)
+            job.chunk_size = TRANSFER_CHUNK_START;
+
+        /* Chunked Graph moves. Pause only for send — not for open-body. */
         uint done = 0;
+        this.transfer_flush_done = 0;
         var t0 = Utils.sync_tick ();
-        var logged_pause = false;
+        var logged_send_pause = false;
         while (done < job.uids.length) {
-            if (this.high_refresh_waiters > 0) {
-                if (!logged_pause) {
-                    Utils.sync_log ("move flush paused “%s” for user (%u/%u)".printf (
+            if (this.send_waiters > 0) {
+                if (!logged_send_pause) {
+                    Utils.sync_log ("move flush paused “%s” for send (%u/%u)".printf (
                         job.from.name,
                         done,
                         job.uids.length
                     ));
-                    logged_pause = true;
+                    logged_send_pause = true;
                 }
-                Timeout.add (250, flush_folder_transfers.callback);
+                Timeout.add (100, flush_folder_transfers.callback);
                 yield;
                 continue;
             }
-            logged_pause = false;
+            logged_send_pause = false;
 
-            var end = done + BATCH;
-            if (end > job.uids.length)
-                end = job.uids.length;
+            this.transfer_flush_done = done;
+            schedule_mutation_registry_save ();
+
+            /* Skip UIDs already confirmed at destination. */
+            while (done < job.uids.length
+                && message_at_destination (dest_folder, job.uids[done])) {
+                rekey_body (job.account, job.from, job.uids[done], job.destination, job.uids[done]);
+                done++;
+            }
+            if (done >= job.uids.length)
+                break;
+
+            var chunk_cap = job.chunk_size;
+            if (chunk_cap < TRANSFER_CHUNK_MIN)
+                chunk_cap = TRANSFER_CHUNK_MIN;
             var batch = new GenericArray<string> ();
-            for (uint i = done; i < end; i++)
-                batch.add (job.uids[i]);
+            for (uint i = done; i < job.uids.length && batch.length < chunk_cap; i++) {
+                var uid = job.uids[i];
+                if (message_at_destination (dest_folder, uid))
+                    break;
+                /* Camel transfer needs a local summary row. After cancel we
+                 * refresh source; if still missing, leave for later refresh. */
+                if (source_folder.get_message_info (uid) == null)
+                    break;
+                batch.add (uid);
+            }
+            if (batch.length == 0) {
+                var uid = job.uids[done];
+                /* Prefer the local dest summary first — a full refresh_info on
+                 * a large destination can exceed the brief budget and stall
+                 * recovery after a cancelled transfer. */
+                if (message_at_destination (dest_folder, uid)) {
+                    rekey_body (job.account, job.from, uid, job.destination, uid);
+                    Utils.sync_log ("move flush claimed at destination “%s” (%u/%u)".printf (
+                        job.from.name,
+                        done + 1,
+                        job.uids.length
+                    ));
+                    done++;
+                    job.stall_rounds = 0;
+                    Idle.add (flush_folder_transfers.callback);
+                    yield;
+                    continue;
+                }
+                /* Dest summary is often stale after frozen transfers. Probe by
+                 * id before waiting on Camel refresh — Graph may already have
+                 * finished the move from a prior session. */
+                {
+                    var hit = yield try_fetch_uid_exists (dest_folder, uid, TRANSFER_DEST_PROBE_SECS);
+                    if (hit == true) {
+                        rekey_body (job.account, job.from, uid, job.destination, uid);
+                        Utils.sync_log ("move flush claimed via fetch “%s” → “%s” (%u/%u)".printf (
+                            job.from.name,
+                            job.destination.name,
+                            done + 1,
+                            job.uids.length
+                        ));
+                        done++;
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+                }
+                if (source_folder.get_message_info (uid) == null) {
+                    yield refresh_folder_info (source_folder, true, null, REFRESH_INFO_BRIEF);
+                    if (message_at_destination (dest_folder, uid)) {
+                        rekey_body (job.account, job.from, uid, job.destination, uid);
+                        done++;
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+                    if (source_folder.get_message_info (uid) == null) {
+                        /* Server rule / other client / prior cancelled Graph move:
+                         * UID left the source summary. Locate or drop — never spin. */
+                        yield resolve_vanished_transfer_uid (
+                            job,
+                            done,
+                            source_folder,
+                            dest_folder,
+                            true
+                        );
+                        if (transfer_job_is_parked (job))
+                            return;
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+                }
+                continue;
+            }
 
-            for (uint i = 0; i < batch.length; i++)
-                yield capture_local_body (job.account, job.from, batch[i], source_folder);
+            for (uint i = 0; i < batch.length; i++) {
+                if (source_folder.get_message_info (batch[i]) != null)
+                    yield capture_local_body (job.account, job.from, batch[i], source_folder);
+            }
 
 #if HAVE_CAMEL_3_58
             GenericArray<weak string>? transferred = null;
@@ -2557,49 +3972,264 @@ public class Mail.MailSession : Camel.Session {
             GenericArray<string>? transferred = null;
 #endif
             try {
-                yield enter_camel (false);
+                yield enter_camel (true);
+                ulong parent_id = 0;
+                uint timeout_id = 0;
+                var timeout_secs = folder_is_heavy (job.destination)
+                    ? TRANSFER_CHUNK_TIMEOUT_HEAVY_SECS
+                    : TRANSFER_CHUNK_TIMEOUT_SECS;
+                var timed = bound_cancellable (
+                    null,
+                    timeout_secs,
+                    out parent_id,
+                    out timeout_id
+                );
+                this.transfer_op_cancellable = timed;
+                freeze_folders_for_transfer (source_folder, dest_folder);
                 try {
+                    var xfer_t0 = Utils.sync_tick ();
                     yield source_folder.transfer_messages_to (
                         batch,
                         dest_folder,
                         job.delete_original,
-                        Priority.LOW,
-                        null,
+                        Priority.DEFAULT,
+                        timed,
                         out transferred
                     );
+                    Utils.sync_log ("move flush Graph transfer “%s” → “%s” chunk %u %s".printf (
+                        job.from.name,
+                        job.destination.name,
+                        batch.length,
+                        Utils.sync_ms (xfer_t0)
+                    ));
                 } finally {
-                    leave_camel (false);
+                    thaw_folders_for_transfer (source_folder, dest_folder);
+                    if (this.transfer_op_cancellable == timed)
+                        this.transfer_op_cancellable = null;
+                    unbind_cancellable (null, parent_id, timeout_id);
+                    leave_camel (true);
                 }
             } catch (Error e) {
+                this.camel_epoch++;
+                this.camel_busy = false;
+
+                if (Utils.is_cancelled_error (e)) {
+                    if (this.send_waiters > 0) {
+                        Utils.sync_log ("move flush interrupted for send (%u/%u)".printf (
+                            done,
+                            job.uids.length
+                        ));
+                        Timeout.add (100, flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    /* Graph may have committed even though Camel timed out.
+                     * Prefer dest id probe over summary — large Archive
+                     * summaries stay stale without an expensive refresh_info. */
+                    var claimed = claim_batch_arrived (job, batch, done, dest_folder, transferred);
+                    if (claimed == 0)
+                        claimed = yield claim_batch_arrived_via_fetch (job, batch, done, dest_folder);
+                    if (claimed == 0) {
+                        yield refresh_folder_info (source_folder, true, null, REFRESH_INFO_BRIEF);
+                        claimed = claim_batch_arrived (job, batch, done, dest_folder, transferred);
+                        if (claimed == 0)
+                            claimed = yield claim_batch_arrived_via_fetch (job, batch, done, dest_folder);
+                    }
+                    if (claimed > 0) {
+                        done += claimed;
+                        Utils.sync_log ("move flush after timeout: %u/%u of chunk at destination".printf (
+                            claimed,
+                            batch.length
+                        ));
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    /* Restore Camel source summary so the next attempt can see UIDs. */
+                    if (source_folder.get_message_info (batch[0]) == null)
+                        yield refresh_folder_info (source_folder, true, null, REFRESH_INFO_BRIEF);
+
+                    if (source_folder.get_message_info (batch[0]) == null) {
+                        yield resolve_vanished_transfer_uid (
+                            job,
+                            done,
+                            source_folder,
+                            dest_folder,
+                            false
+                        );
+                        if (transfer_job_is_parked (job))
+                            return;
+                        /* resolve dropped, deferred, or claimed — continue wave. */
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    job.stall_rounds++;
+                    var left = job.uids.length > done ? job.uids.length - done : 0;
+                    /* After a hang, shrink to one UID so later UIDs can make
+                     * progress instead of re-timing out on the same batch. */
+                    if (job.chunk_size > TRANSFER_CHUNK_MIN) {
+                        Utils.sync_log ("move flush hang — shrink chunk %u → 1 (%u left)".printf (
+                            job.chunk_size,
+                            left
+                        ));
+                        job.chunk_size = TRANSFER_CHUNK_MIN;
+                        job.stall_rounds = 0;
+                        Timeout.add (500, flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+                    if (source_folder.get_message_info (batch[0]) == null) {
+                        /* After cancelled move: locate/claim only — never purge
+                         * (Graph may still be settling). */
+                        yield resolve_vanished_transfer_uid (
+                            job,
+                            done,
+                            source_folder,
+                            dest_folder,
+                            false
+                        );
+                        if (transfer_job_is_parked (job))
+                            return;
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+                    if (job.stall_rounds <= 2) {
+                        Utils.sync_log ("move flush timeout — retry uid (%u left)".printf (left));
+                        Timeout.add (750, flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    Utils.sync_log ("move flush stall — defer uid to end (%u left)".printf (left));
+                    job.stall_rounds = 0;
+                    defer_transfer_range (job, done, 1);
+                    Timeout.add (job.uids.length < 2 ? 2000 : 250, flush_folder_transfers.callback);
+                    yield;
+                    continue;
+                }
+
+                if (is_missing_on_server (e)) {
+                    /* Check dest summary / id probe first; a full dest refresh_info
+                     * can exceed the brief budget on large folders. */
+                    var claimed = claim_batch_arrived (job, batch, done, dest_folder, null);
+                    if (claimed == 0)
+                        claimed = yield claim_batch_arrived_via_fetch (job, batch, done, dest_folder);
+                    if (claimed > 0) {
+                        done += claimed;
+                        Utils.sync_log ("move flush partial missing — arrived %u/%u".printf (
+                            claimed,
+                            batch.length
+                        ));
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    var gone_from_source = 0u;
+                    for (uint i = 0; i < batch.length; i++) {
+                        if (source_folder.get_message_info (batch[i]) == null)
+                            gone_from_source++;
+                    }
+
+                    /* Gone from source and not at dest yet — locate carefully. */
+                    if (gone_from_source > 0
+                        && source_folder.get_message_info (batch[0]) == null) {
+                        yield resolve_vanished_transfer_uid (
+                            job,
+                            done,
+                            source_folder,
+                            dest_folder,
+                            true
+                        );
+                        if (transfer_job_is_parked (job))
+                            return;
+                        job.stall_rounds = 0;
+                        Idle.add (flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    /* Still in source: Graph ErrorItemNotFound is often a batch
+                     * flake — must not spin. Shrink to 1 and back off. */
+                    var left = job.uids.length > done ? job.uids.length - done : 0;
+                    job.stall_rounds++;
+                    if (job.chunk_size > TRANSFER_CHUNK_MIN) {
+                        Utils.sync_log ("move flush missing flake — shrink chunk %u → 1 (%u left): %s".printf (
+                            job.chunk_size,
+                            left,
+                            e.message ?? ""
+                        ));
+                        job.chunk_size = TRANSFER_CHUNK_MIN;
+                        job.stall_rounds = 0;
+                        Timeout.add (500, flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+                    if (job.stall_rounds <= 3) {
+                        Utils.sync_log ("move flush missing flake — retry uid (%u left): %s".printf (
+                            left,
+                            e.message ?? ""
+                        ));
+                        Timeout.add (1000, flush_folder_transfers.callback);
+                        yield;
+                        continue;
+                    }
+
+                    Utils.sync_log ("move flush missing flake — defer uid (%u left): %s".printf (
+                        left,
+                        e.message ?? ""
+                    ));
+                    job.stall_rounds = 0;
+                    defer_transfer_range (job, done, 1);
+                    Timeout.add (1500, flush_folder_transfers.callback);
+                    yield;
+                    continue;
+                }
+
                 warning ("Could not move messages: %s", e.message);
                 finish_transfer_job (job, done, e.message);
                 return;
             }
 
             for (uint i = 0; i < batch.length; i++) {
-                var new_uid = batch[i];
+                var uid = batch[i];
+                var new_uid = uid;
                 if (transferred != null && i < transferred.length
                     && transferred[i] != null && transferred[i].length > 0)
                     new_uid = transferred[i];
-                rekey_body (job.account, job.from, batch[i], job.destination, new_uid);
-                var message_index = done + i;
-                if (job.messages != null && message_index < job.messages.length) {
-                    var message = job.messages[message_index];
+                rekey_body (job.account, job.from, uid, job.destination, new_uid);
+                var msg_index = done + i;
+                if (job.messages != null && msg_index < job.messages.length) {
+                    var message = job.messages[msg_index];
                     if (message != null && new_uid != message.uid)
                         message.uid = new_uid;
                 }
             }
 
-            done = end;
-            if (done == job.uids.length || done % 30 == 0) {
-                Utils.sync_log ("move flush “%s” → “%s” %u/%u %s".printf (
-                    job.from.name,
-                    job.destination.name,
-                    done,
-                    job.uids.length,
-                    Utils.sync_ms (t0)
-                ));
+            job.stall_rounds = 0;
+            if (job.chunk_size < TRANSFER_CHUNK_DEFAULT) {
+                job.chunk_size = job.chunk_size * 2;
+                if (job.chunk_size > TRANSFER_CHUNK_DEFAULT)
+                    job.chunk_size = TRANSFER_CHUNK_DEFAULT;
             }
+            done += batch.length;
+            Utils.sync_log ("move flush “%s” → “%s” %u/%u (chunk %u) %s".printf (
+                job.from.name,
+                job.destination.name,
+                done,
+                job.uids.length,
+                batch.length,
+                Utils.sync_ms (t0)
+            ));
 
             Idle.add (flush_folder_transfers.callback);
             yield;
@@ -2612,6 +4242,509 @@ public class Mail.MailSession : Camel.Session {
             bump_transfer_pending (job.account, job.destination, -1);
     }
 
+    private static bool message_at_destination (Camel.Folder dest, string uid) {
+        return dest.get_message_info (uid) != null;
+    }
+
+    /* After a timed-out Graph move, the dest summary is often stale on large
+     * folders. get_message(uid) can still confirm the item landed. */
+    private async uint claim_batch_arrived_via_fetch (
+        TransferFlushJob job,
+        GenericArray<string> batch,
+        uint done,
+        Camel.Folder dest
+    ) {
+        uint claimed = 0;
+        for (uint i = 0; i < batch.length; i++) {
+            var uid = batch[i];
+            if (message_at_destination (dest, uid)) {
+                rekey_body (job.account, job.from, uid, job.destination, uid);
+                claimed++;
+                continue;
+            }
+            var hit = yield try_fetch_uid_exists (dest, uid, TRANSFER_DEST_PROBE_SECS);
+            if (hit != true)
+                break;
+            rekey_body (job.account, job.from, uid, job.destination, uid);
+            var msg_index = done + i;
+            if (job.messages != null && msg_index < job.messages.length) {
+                var message = job.messages[msg_index];
+                if (message != null)
+                    message.uid = uid;
+            }
+            Utils.sync_log ("move flush claimed via dest fetch “%s”".printf (job.destination.name));
+            claimed++;
+        }
+        return claimed;
+    }
+
+    /* UID vanished from the source Camel summary (server rule, other client,
+     * or a cancelled Graph move that already committed). Locate it in likely
+     * folders. Only purge local data when @allow_purge and every probe
+     * confirms absence — a single-folder ErrorItemNotFound is not enough. */
+    private async void resolve_vanished_transfer_uid (
+        TransferFlushJob job,
+        uint index,
+        Camel.Folder source_folder,
+        Camel.Folder dest_folder,
+        bool allow_purge
+    ) {
+        if (index >= job.uids.length)
+            return;
+        var uid = job.uids[index];
+        var left = job.uids.length > index ? job.uids.length - index : 0;
+        var remaining_after = left > 0 ? left - 1 : 0;
+
+        if (message_at_destination (dest_folder, uid)) {
+            rekey_body (job.account, job.from, uid, job.destination, uid);
+            remove_transfer_uid_at (job, index);
+            Utils.sync_log ("move flush locate: already at “%s” (%u left)".printf (
+                job.destination.name,
+                remaining_after
+            ));
+            return;
+        }
+
+        /* Dest id probe first — the usual landing place after a hung move. */
+        var dest_hit = yield try_fetch_uid_exists (dest_folder, uid, TRANSFER_DEST_PROBE_SECS);
+        if (dest_hit == true) {
+            rekey_body (job.account, job.from, uid, job.destination, uid);
+            remove_transfer_uid_at (job, index);
+            Utils.sync_log ("move flush locate: fetched at “%s” (%u left)".printf (
+                job.destination.name,
+                remaining_after
+            ));
+            return;
+        }
+
+        bool confirmed_absent;
+        bool reachable_unindexed;
+        var found = yield seek_vanished_uid (
+            job.account,
+            job.from,
+            job.destination,
+            uid,
+            source_folder,
+            dest_folder,
+            out confirmed_absent,
+            out reachable_unindexed
+        );
+        if (found != null) {
+            rekey_body (job.account, job.from, uid, found, uid);
+            remove_transfer_uid_at (job, index);
+            Utils.sync_log ("move flush locate: “%s” now in “%s” — drop from queue (%u left)".printf (
+                job.from.name,
+                found.name,
+                remaining_after
+            ));
+            return;
+        }
+
+        if (confirmed_absent && allow_purge) {
+            yield forget_vanished_transfer_uid (job.account, job.from, source_folder, uid);
+            remove_transfer_uid_at (job, index);
+            Utils.sync_log ("move flush locate: confirmed absent in all probed folders — drop (%u left)".printf (
+                remaining_after
+            ));
+            return;
+        }
+
+        /* Not safe to purge: keep body. Defer this UID and keep draining the
+         * rest of the job in the same wave (do not park the whole remainder). */
+        if (folder_is_parkable_heavy (job.destination) && !allow_purge) {
+            Utils.sync_log ("move flush locate: defer uid after cancel (%u left) — %s".printf (
+                remaining_after,
+                confirmed_absent
+                    ? "absent after cancel"
+                    : (reachable_unindexed ? "reachable unindexed" : "unconfirmed after cancel")
+            ));
+            defer_transfer_range (job, index, 1);
+            return;
+        }
+
+        remove_transfer_uid_at (job, index);
+        if (confirmed_absent && !allow_purge) {
+            Utils.sync_log ("move flush locate: absent after cancel — keep local body (%u left)".printf (
+                remaining_after
+            ));
+        } else if (reachable_unindexed) {
+            Utils.sync_log ("move flush locate: still reachable by id, folder unknown — keep local body (%u left)".printf (
+                remaining_after
+            ));
+        } else {
+            Utils.sync_log ("move flush locate: unconfirmed — keep local body, skip move (%u left)".printf (
+                remaining_after
+            ));
+        }
+    }
+
+    private void remove_transfer_uid_at (TransferFlushJob job, uint index) {
+        if (index >= job.uids.length)
+            return;
+        var uids = new GenericArray<string> ();
+        GenericArray<Message>? messages = null;
+        if (job.messages != null)
+            messages = new GenericArray<Message> ();
+        for (uint i = 0; i < job.uids.length; i++) {
+            if (i == index)
+                continue;
+            uids.add (job.uids[i]);
+            if (messages != null && job.messages != null && i < job.messages.length)
+                messages.add (job.messages[i]);
+        }
+        job.uids = uids;
+        job.messages = messages;
+        schedule_mutation_registry_save ();
+    }
+
+    private async void forget_vanished_transfer_uid (
+        Account account,
+        Folder from,
+        Camel.Folder source_folder,
+        string uid
+    ) {
+        var key = body_key (account, from, uid);
+        this.body_cache.remove (key);
+        yield drop_disk_body (source_folder, uid, null);
+    }
+
+    /* Walk likely folders once. Returns the folder when found; otherwise sets
+     * confirmed_absent only if every get_message probe returned NOT_FOUND. */
+    private async Folder? seek_vanished_uid (
+        Account account,
+        Folder from,
+        Folder destination,
+        string uid,
+        Camel.Folder source_folder,
+        Camel.Folder dest_folder,
+        out bool confirmed_absent,
+        out bool reachable_unindexed
+    ) {
+        confirmed_absent = false;
+        reachable_unindexed = false;
+
+        var candidates = yield transfer_locate_candidates (account, from, destination);
+        var dest_full = dest_folder.get_full_name () ?? destination.full_name;
+
+        /* Pass 1: local Camel summaries only (fast). */
+        for (uint i = 0; i < candidates.length; i++) {
+            var folder = candidates[i];
+            try {
+                var camel = folder.full_name == destination.full_name
+                    ? dest_folder
+                    : yield open_camel_folder (account, folder, null);
+                if (camel.get_message_info (uid) != null)
+                    return folder;
+            } catch (Error e) {
+                debug ("locate open “%s”: %s", folder.name, e.message);
+            }
+        }
+
+        /* Pass 2: brief refresh on small likely targets (not Archive). */
+        for (uint i = 0; i < candidates.length; i++) {
+            var folder = candidates[i];
+            if (folder_is_heavy (folder))
+                continue;
+            try {
+                var camel = folder.full_name == destination.full_name
+                    ? dest_folder
+                    : yield open_camel_folder (account, folder, null);
+                yield refresh_folder_info (camel, true, null, REFRESH_INFO_BRIEF);
+                if (camel.get_message_info (uid) != null)
+                    return folder;
+            } catch (Error e) {
+                debug ("locate refresh “%s”: %s", folder.name, e.message);
+            }
+        }
+
+        /* Pass 3: folder-scoped get_message by id on source + every candidate.
+         * NOT_FOUND in one folder is not global deletion on Graph. */
+        bool any_unknown = false;
+        bool any_hit = false;
+        uint missing_probes = 0;
+        uint total_probes = 0;
+
+        var source_hit = yield try_fetch_uid_exists (source_folder, uid);
+        total_probes++;
+        if (source_hit == true) {
+            any_hit = true;
+            reachable_unindexed = true;
+        } else if (source_hit == false) {
+            missing_probes++;
+        } else {
+            any_unknown = true;
+        }
+
+        for (uint i = 0; i < candidates.length; i++) {
+            var folder = candidates[i];
+            if (folder.full_name == from.full_name)
+                continue;
+
+            Camel.Folder camel;
+            if (folder.full_name == destination.full_name || folder.full_name == dest_full) {
+                camel = dest_folder;
+            } else {
+                try {
+                    camel = yield open_camel_folder (account, folder, null);
+                } catch (Error e) {
+                    debug ("locate fetch-open “%s”: %s", folder.name, e.message);
+                    any_unknown = true;
+                    continue;
+                }
+            }
+
+            var probe_secs = (folder.full_name == destination.full_name
+                || folder_is_heavy (folder))
+                ? TRANSFER_DEST_PROBE_SECS
+                : 8;
+            var hit = yield try_fetch_uid_exists (camel, uid, probe_secs);
+            total_probes++;
+            if (hit == true)
+                return folder;
+            if (hit == false)
+                missing_probes++;
+            else
+                any_unknown = true;
+        }
+
+        if (any_hit && !any_unknown) {
+            /* Source get_message worked but no folder claimed it — keep body. */
+            reachable_unindexed = true;
+            return null;
+        }
+
+        confirmed_absent = !any_unknown && !any_hit
+            && total_probes > 0
+            && missing_probes == total_probes;
+        return null;
+    }
+
+    private async bool? try_fetch_uid_exists (
+        Camel.Folder camel_folder,
+        string uid,
+        uint timeout_secs = 8
+    ) {
+        ulong parent_id = 0;
+        uint timeout_id = 0;
+        var timed = bound_cancellable (null, timeout_secs > 0 ? timeout_secs : 8, out parent_id, out timeout_id);
+        try {
+            yield enter_camel (true);
+            try {
+                var mime = yield camel_folder.get_message (uid, Priority.DEFAULT, timed);
+                return mime != null;
+            } finally {
+                leave_camel (true);
+            }
+        } catch (Error e) {
+            if (is_missing_on_server (e) || error_text_means_missing (e.message))
+                return false;
+            if (Utils.is_cancelled_error (e))
+                return null;
+            Utils.sync_log ("locate probe get_message “%s”: %s".printf (
+                camel_folder.get_full_display_name () ?? camel_folder.get_full_name () ?? "?",
+                e.message
+            ));
+            return null;
+        } finally {
+            unbind_cancellable (null, parent_id, timeout_id);
+        }
+    }
+
+    private async GenericArray<Folder> transfer_locate_candidates (
+        Account account,
+        Folder from,
+        Folder destination
+    ) {
+        var out = new GenericArray<Folder> ();
+        var seen = new HashTable<string, uint8> (str_hash, str_equal);
+
+        if (destination.full_name != from.full_name) {
+            seen.set (destination.full_name, 1);
+            out.add (destination);
+        }
+
+        GenericArray<Folder> folders;
+        try {
+            folders = yield list_folders (account, null, false);
+        } catch (Error e) {
+            debug ("locate folder list: %s", e.message);
+            return out;
+        }
+
+        Folder? trash = null;
+        Folder? junk = null;
+        Folder? archive = null;
+        Folder? inbox = null;
+        Folder? sent = null;
+        for (uint i = 0; i < folders.length; i++) {
+            switch (folders[i].kind) {
+                case FolderKind.TRASH:
+                    if (trash == null)
+                        trash = folders[i];
+                    break;
+                case FolderKind.JUNK:
+                    if (junk == null)
+                        junk = folders[i];
+                    break;
+                case FolderKind.ARCHIVE:
+                case FolderKind.ALL:
+                    if (archive == null)
+                        archive = folders[i];
+                    break;
+                case FolderKind.INBOX:
+                    if (inbox == null)
+                        inbox = folders[i];
+                    break;
+                case FolderKind.SENT:
+                    if (sent == null)
+                        sent = folders[i];
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        Folder?[] priority = { trash, junk, archive, inbox, sent };
+        for (uint i = 0; i < priority.length; i++) {
+            var folder = priority[i];
+            if (folder == null || folder.full_name == from.full_name)
+                continue;
+            if (seen.contains (folder.full_name))
+                continue;
+            seen.set (folder.full_name, 1);
+            out.add (folder);
+        }
+
+        /* Siblings under the same parent (e.g. other Inbox children). */
+        var slash = from.full_name.last_index_of_char ('/');
+        var parent = slash > 0 ? from.full_name.substring (0, slash) : "";
+        for (uint i = 0; i < folders.length && out.length < 16; i++) {
+            var folder = folders[i];
+            if (parent.length == 0)
+                continue;
+            if (folder.full_name == from.full_name)
+                continue;
+            if (!folder.full_name.has_prefix (parent + "/"))
+                continue;
+            if (folder.full_name.contains ("/")
+                && folder.full_name.substring (parent.length + 1).contains ("/"))
+                continue;
+            if (seen.contains (folder.full_name))
+                continue;
+            seen.set (folder.full_name, 1);
+            out.add (folder);
+        }
+        return out;
+    }
+
+    /* Drop leading UIDs that already live in dest (same Graph id across folders). */
+    private void claim_uids_already_at_destination (
+        TransferFlushJob job,
+        Camel.Folder dest,
+        uint from_index
+    ) {
+        if (from_index >= job.uids.length)
+            return;
+
+        var kept_uids = new GenericArray<string> ();
+        GenericArray<Message>? kept_messages = null;
+        if (job.messages != null)
+            kept_messages = new GenericArray<Message> ();
+
+        for (uint i = 0; i < from_index; i++) {
+            kept_uids.add (job.uids[i]);
+            if (kept_messages != null && job.messages != null && i < job.messages.length)
+                kept_messages.add (job.messages[i]);
+        }
+        for (uint i = from_index; i < job.uids.length; i++) {
+            var uid = job.uids[i];
+            if (message_at_destination (dest, uid)) {
+                rekey_body (job.account, job.from, uid, job.destination, uid);
+                continue;
+            }
+            kept_uids.add (uid);
+            if (kept_messages != null && job.messages != null && i < job.messages.length)
+                kept_messages.add (job.messages[i]);
+        }
+        job.uids = kept_uids;
+        job.messages = kept_messages;
+    }
+
+    /* How many leading UIDs of this batch are already at dest (prefix only). */
+    private uint claim_batch_arrived (
+        TransferFlushJob job,
+        GenericArray<string> batch,
+        uint done,
+        Camel.Folder dest,
+#if HAVE_CAMEL_3_58
+        GenericArray<weak string>? transferred
+#else
+        GenericArray<string>? transferred
+#endif
+    ) {
+        uint claimed = 0;
+        for (uint i = 0; i < batch.length; i++) {
+            var uid = batch[i];
+            var new_uid = uid;
+            if (transferred != null && i < transferred.length
+                && transferred[i] != null && transferred[i].length > 0)
+                new_uid = transferred[i];
+            if (!message_at_destination (dest, uid) && !message_at_destination (dest, new_uid))
+                break;
+            rekey_body (job.account, job.from, uid, job.destination, new_uid);
+            var msg_index = done + i;
+            if (job.messages != null && msg_index < job.messages.length) {
+                var message = job.messages[msg_index];
+                if (message != null && new_uid != message.uid)
+                    message.uid = new_uid;
+            }
+            claimed++;
+        }
+        return claimed;
+    }
+
+    /* After repeated Graph timeouts, try other UIDs first instead of dropping. */
+    private static void defer_transfer_range (TransferFlushJob job, uint index, uint count) {
+        if (count == 0 || index >= job.uids.length)
+            return;
+        if (count > job.uids.length - index)
+            count = job.uids.length - index;
+        if (job.uids.length < 2 || count >= job.uids.length)
+            return;
+
+        var deferred_uids = new GenericArray<string> ();
+        GenericArray<Message>? deferred_messages = null;
+        if (job.messages != null)
+            deferred_messages = new GenericArray<Message> ();
+
+        for (uint i = 0; i < count; i++) {
+            deferred_uids.add (job.uids[index + i]);
+            if (deferred_messages != null && job.messages != null && index + i < job.messages.length)
+                deferred_messages.add (job.messages[index + i]);
+        }
+
+        var uids = new GenericArray<string> ();
+        GenericArray<Message>? messages = null;
+        if (job.messages != null)
+            messages = new GenericArray<Message> ();
+
+        for (uint i = 0; i < job.uids.length; i++) {
+            if (i >= index && i < index + count)
+                continue;
+            uids.add (job.uids[i]);
+            if (messages != null && job.messages != null && i < job.messages.length)
+                messages.add (job.messages[i]);
+        }
+        for (uint i = 0; i < deferred_uids.length; i++) {
+            uids.add (deferred_uids[i]);
+            if (messages != null && deferred_messages != null)
+                messages.add (deferred_messages[i]);
+        }
+
+        job.uids = uids;
+        job.messages = messages;
+    }
+
     private void finish_transfer_job (TransferFlushJob job, uint done, string error) {
         bump_transfer_pending (job.account, job.from, -1);
         if (job.from.full_name != job.destination.full_name)
@@ -2620,7 +4753,42 @@ public class Mail.MailSession : Camel.Session {
         var remaining = new GenericArray<string> ();
         for (uint i = done; i < job.uids.length; i++)
             remaining.add (job.uids[i]);
+        if (remaining.length == 0) {
+            schedule_mutation_registry_save ();
+            return;
+        }
+        /* Never surface cancel/timeout as a user-visible transfer failure —
+         * that un-hides archived mail and shows “operation cancelled”. */
+        var down = error.down ();
+        if (down.contains ("cancel") || down.contains ("annullat") || down.contains ("abgebrochen")) {
+            Utils.sync_log ("move flush soft-fail (cancel) — requeue %u".printf (remaining.length));
+            this.transfer_flush_queue.add (new TransferFlushJob () {
+                account = job.account,
+                from = job.from,
+                destination = job.destination,
+                uids = remaining,
+                messages = null,
+                delete_original = job.delete_original,
+                chunk_size = job.chunk_size > 0 ? job.chunk_size : TRANSFER_CHUNK_START,
+            });
+            bump_transfer_pending (job.account, job.from, 1);
+            if (job.from.full_name != job.destination.full_name)
+                bump_transfer_pending (job.account, job.destination, 1);
+            schedule_mutation_registry_save ();
+            Timeout.add_seconds (3, () => {
+                pump_transfer_flush.begin ();
+                return Source.REMOVE;
+            });
+            return;
+        }
+        /* Item already gone on Graph — keep hides, do not toast. */
+        if (error_text_means_missing (error)) {
+            Utils.sync_log ("move flush soft-fail (missing) — drop %u without unhide".printf (remaining.length));
+            schedule_mutation_registry_save ();
+            return;
+        }
         this.transfer_failed (job.account, job.from, remaining, error);
+        schedule_mutation_registry_save ();
     }
 
     public async void create_mailbox_folder (Account account, Folder parent, string name) throws Error {
@@ -2704,10 +4872,18 @@ public class Mail.MailSession : Camel.Session {
     }
 
     private static bool is_missing_on_server (Error error) {
-        var text = error.message ?? "";
         return error is IOError.NOT_FOUND
-            || text.contains ("ErrorItemNotFound")
-            || text.contains ("not found in the store");
+            || error_text_means_missing (error.message);
+    }
+
+    public static bool error_text_means_missing (string? text) {
+        if (text == null || text.length == 0)
+            return false;
+        var down = text.down ();
+        return down.contains ("erroritemnotfound")
+            || down.contains ("not found in the store")
+            || down.contains ("specified object was not found")
+            || down.contains ("failed to get the correct properties");
     }
 
     private async Camel.Folder open_camel_folder (Account account, Folder folder, Cancellable? cancellable) throws Error {
@@ -3015,11 +5191,27 @@ public class Mail.MailSession : Camel.Session {
         bool saved = false;
         var t0 = Utils.sync_tick ();
         Utils.sync_log ("send start from=%s to=%s".printf (identity.address, to));
-        yield enter_camel (true);
+        Utils.sync_log ("send mime recipients to=%s cc=%s bcc=%s".printf (
+            to_addr.encode () ?? "",
+            cc_addr.length () > 0 ? (cc_addr.encode () ?? "") : "",
+            bcc_addr.length () > 0 ? (bcc_addr.encode () ?? "") : ""
+        ));
+        send_starting ();
+        this.send_waiters++;
         try {
-            yield transport.send_to (mime, from_addr, recipients, Priority.DEFAULT, cancellable, out saved);
+            yield enter_camel (true);
+            ulong parent_id = 0;
+            uint timeout_id = 0;
+            var timed = bound_cancellable (cancellable, 90, out parent_id, out timeout_id);
+            try {
+                yield transport.send_to (mime, from_addr, recipients, Priority.DEFAULT, timed, out saved);
+            } finally {
+                unbind_cancellable (cancellable, parent_id, timeout_id);
+                leave_camel (true);
+            }
         } finally {
-            leave_camel (true);
+            this.send_waiters--;
+            send_finished ();
         }
         Utils.sync_log ("send_to done %s saved_on_server=%s".printf (Utils.sync_ms (t0), saved.to_string ()));
 
@@ -3062,8 +5254,12 @@ public class Mail.MailSession : Camel.Session {
         GenericArray<Attachment>? attachments = null,
         MessageContent? reply_of = null,
         bool is_forward = false,
-        Cancellable? cancellable = null
+        Cancellable? cancellable = null,
+        string? replace_uid = null,
+        Folder? replace_folder = null,
+        out Folder? drafts_folder = null
     ) throws Error {
+        drafts_folder = null;
         var identity = get_identity (account);
         if (identity == null) {
             throw new IOError.FAILED (_("This account has no sending identity."));
@@ -3089,11 +5285,23 @@ public class Mail.MailSession : Camel.Session {
         if (drafts == null)
             return null;
 
+        drafts_folder = drafts;
         if (uid == null || uid.length == 0)
             uid = "local-draft-%lld".printf (new DateTime.now_utc ().to_unix ());
         var content = MessageContent.from_mime (uid, mime);
         this.body_cache.set (body_key (account, drafts, uid), content);
         var draft = message_from_mime (uid, mime, drafts, content.plain_text ?? body);
+
+        /* Replace previous revision locally; sync timer pushes append/delete. */
+        if (replace_uid != null && replace_uid.length > 0 && replace_uid != uid) {
+            var old_folder = replace_folder ?? drafts;
+            try {
+                yield delete_message_local (account, old_folder, replace_uid);
+            } catch (Error e) {
+                warning ("Could not replace previous draft: %s", e.message);
+            }
+        }
+
         draft_saved (account, draft);
         return draft;
     }
@@ -3280,29 +5488,43 @@ public class Mail.MailSession : Camel.Session {
         string? html,
         GenericArray<Attachment>? attachments
     ) {
-        var has_html = html != null && html.strip ().length > 0;
+        var inlines = new GenericArray<Attachment> ();
+        var use_html = html;
+        if (html != null && html.strip ().length > 0)
+            use_html = extract_inline_data_images (html, inlines);
+
+        var has_html = use_html != null && use_html.strip ().length > 0;
         var has_files = attachments != null && attachments.length > 0;
+        var has_inline = inlines.length > 0;
+
+        Camel.DataWrapper body;
+        if (has_html)
+            body = build_alternative (plain, use_html);
+        else {
+            var text_part = new Camel.MimePart ();
+            text_part.set_content (plain.data, "text/plain; charset=UTF-8");
+            text_part.set_encoding (Camel.TransferEncoding.ENCODING_8BIT);
+            body = text_part;
+        }
+
+        if (has_inline)
+            body = wrap_related (body, inlines);
 
         if (!has_files)
-            return build_alternative (plain, html);
+            return body;
 
         var mixed = new Camel.Multipart ();
         mixed.set_mime_type ("multipart/mixed");
         mixed.set_boundary (null);
 
-        if (has_html) {
-            var body_part = new Camel.MimePart ();
-            ((Camel.Medium) body_part).set_content (build_alternative (plain, html));
-            mixed.add_part (body_part);
-        } else {
-            var text_part = new Camel.MimePart ();
-            text_part.set_content (plain.data, "text/plain; charset=UTF-8");
-            text_part.set_encoding (Camel.TransferEncoding.ENCODING_8BIT);
-            mixed.add_part (text_part);
-        }
+        var body_part = new Camel.MimePart ();
+        ((Camel.Medium) body_part).set_content (body);
+        mixed.add_part (body_part);
 
         for (uint i = 0; i < attachments.length; i++) {
             var attachment = attachments[i];
+            if (attachment.inline_part)
+                continue;
             var part = new Camel.MimePart ();
             unowned uint8[] data = attachment.data.get_data ();
             var type = attachment.mime_type;
@@ -3316,6 +5538,118 @@ public class Mail.MailSession : Camel.Session {
         }
 
         return mixed;
+    }
+
+    private static Camel.DataWrapper wrap_related (Camel.DataWrapper body, GenericArray<Attachment> inlines) {
+        var related = new Camel.Multipart ();
+        related.set_mime_type ("multipart/related");
+        related.set_boundary (null);
+
+        var body_part = new Camel.MimePart ();
+        ((Camel.Medium) body_part).set_content (body);
+        related.add_part (body_part);
+
+        for (uint i = 0; i < inlines.length; i++) {
+            var image = inlines[i];
+            var part = new Camel.MimePart ();
+            unowned uint8[] data = image.data.get_data ();
+            var type = image.mime_type;
+            if (type == null || type.length == 0)
+                type = "image/png";
+            part.set_content (data, type);
+            if (image.content_id != null && image.content_id.length > 0)
+                part.set_content_id (image.content_id);
+            if (image.filename != null && image.filename.length > 0)
+                part.set_filename (image.filename);
+            part.set_disposition ("inline");
+            part.set_encoding (Camel.TransferEncoding.ENCODING_BASE64);
+            related.add_part (part);
+        }
+
+        return related;
+    }
+
+    /* Turn data:image…;base64,… HTML into multipart/related CID parts.
+     * Graph/Gmail routinely strip raw data-URI images from HTML-only bodies. */
+    private static string extract_inline_data_images (string html, GenericArray<Attachment> inlines) {
+        var result = new StringBuilder ();
+        int cursor = 0;
+        uint serial = 0;
+        while (cursor < html.length) {
+            var start = html.index_of ("data:image/", cursor);
+            if (start < 0) {
+                result.append (html.substring (cursor));
+                break;
+            }
+
+            var quote = '\0';
+            if (start > 0 && (html[start - 1] == '"' || html[start - 1] == '\''))
+                quote = html[start - 1];
+
+            var meta_end = html.index_of (";base64,", start);
+            if (meta_end < 0) {
+                result.append (html.substring (cursor, start + 11 - cursor));
+                cursor = start + 11;
+                continue;
+            }
+
+            var mime = html.substring (start + 5, meta_end - (start + 5)).strip ();
+            var data_start = meta_end + 8; /* ";base64," */
+            int data_end;
+            if (quote != '\0') {
+                data_end = html.index_of_char (quote, data_start);
+                if (data_end < 0)
+                    data_end = html.length;
+            } else {
+                data_end = data_start;
+                while (data_end < html.length) {
+                    var c = html[data_end];
+                    if (c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                        || c == '"' || c == '\'' || c == '>' || c == ')')
+                        break;
+                    data_end++;
+                }
+            }
+
+            var b64 = html.substring (data_start, data_end - data_start)
+                .replace ("\n", "")
+                .replace ("\r", "")
+                .replace (" ", "");
+            var raw = Base64.decode (b64);
+            if (raw.length == 0) {
+                result.append (html.substring (cursor, data_end - cursor));
+                cursor = data_end;
+                continue;
+            }
+
+            serial++;
+            var cid = "letter.inline.%u@localhost".printf (serial);
+            var ext = "png";
+            var mime_down = mime.down ();
+            if (mime_down.has_suffix ("jpeg") || mime_down.has_suffix ("jpg"))
+                ext = "jpg";
+            else if (mime_down.has_suffix ("gif"))
+                ext = "gif";
+            else if (mime_down.has_suffix ("webp"))
+                ext = "webp";
+            inlines.add (new Attachment () {
+                filename = "image-%u.%s".printf (serial, ext),
+                mime_type = mime,
+                data = new Bytes (raw),
+                content_id = cid,
+                inline_part = true,
+            });
+
+            result.append (html.substring (cursor, start - cursor));
+            result.append ("cid:");
+            result.append (cid);
+            /* Leave the closing quote / following HTML for the next copy. */
+            cursor = data_end;
+        }
+
+        if (inlines.length > 0)
+            Utils.sync_log ("outgoing inline images: %u CID part(s)".printf (inlines.length));
+        return result.str;
     }
 
     private static Camel.Multipart build_alternative (string plain, string html) {
@@ -3643,7 +5977,9 @@ public class Mail.MailSession : Camel.Session {
 
             if (!is_valid_email (addr)) {
                 throw new IOError.INVALID_ARGUMENT (
-                    _("“%s” is not a valid email address.").printf (addr.length > 0 ? addr : _("recipient"))
+                    _("“%s” is not a valid email address. Group and personal names need a full address like name@example.com.").printf (
+                        addr.length > 0 ? addr : _("recipient")
+                    )
                 );
             }
         }
@@ -3670,6 +6006,8 @@ public class Mail.Attachment : Object {
     public string mime_type { get; set; }
     public Bytes data { get; set; }
     public File? file { get; set; }
+    public string? content_id { get; set; }
+    public bool inline_part { get; set; }
 
     public bool is_message {
         get {

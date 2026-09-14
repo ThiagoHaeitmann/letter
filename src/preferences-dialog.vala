@@ -185,7 +185,7 @@ public class Mail.PreferencesDialog : Adw.PreferencesDialog {
 
         this.cache_days_row = new Adw.ComboRow () {
             title = _("Download message bodies"),
-            subtitle_lines = 2,
+            subtitle_lines = 3,
             model = new Gtk.StringList ({
                 _("Last 2 months"),
                 _("Last 6 months"),
@@ -206,7 +206,7 @@ public class Mail.PreferencesDialog : Adw.PreferencesDialog {
 
         this.cache_group = new Adw.PreferencesGroup () {
             title = _("Local library"),
-            description = _("Letter stores headers and recent bodies itself. At startup it trims bodies outside your download window. Clearing an account removes only that local copy; mail stays on the server."),
+            description = _("Letter caches headers and full messages (bodies and attachments) for every folder in the window below. First fill can take hours; Inbox checks and sending stay responsive. Progress resumes after restart."),
         };
         this.total_row = new Adw.ActionRow () {
             title = _("Disk used"),
@@ -379,7 +379,7 @@ public class Mail.PreferencesDialog : Adw.PreferencesDialog {
     }
 
     private void update_cache_subtitle () {
-        var text = _("Keep full messages for this period. Older bodies are removed at startup; headers stay for search.");
+        var text = _("Applies to all folders (Inbox, Archive, Sent, Trash, custom, …). Older bodies are trimmed at startup; headers stay for the message list.");
         if (this.cache_days_row.selected == 3) {
             this.cache_days_row.subtitle = "%s\n%s".printf (
                 text,

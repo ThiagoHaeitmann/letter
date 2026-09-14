@@ -140,15 +140,133 @@ namespace Mail.Utils {
     }
 
     public static void open_online_account (string? account_id) {
+        if (open_online_accounts_panel ())
+            return;
+
         string[] cmd;
         if (account_id != null && account_id.length > 0)
             cmd = { "gnome-control-center", "online-accounts", account_id };
         else
             cmd = { "gnome-control-center", "online-accounts" };
+        if (spawn_host_or_local (cmd))
+            return;
+
+        warning ("Could not open GNOME Settings → Online Accounts");
+    }
+
+    private static bool open_online_accounts_panel () {
+        string[] bus_names = { "org.gnome.Settings", "org.gnome.ControlCenter" };
+        foreach (unowned string bus_name in bus_names) {
+            try {
+                var path = "/" + bus_name.replace (".", "/");
+                var proxy = new DBusProxy.for_bus_sync (
+                    BusType.SESSION,
+                    DBusProxyFlags.NONE,
+                    null,
+                    bus_name,
+                    path,
+                    "org.gtk.Actions",
+                    null
+                );
+                var empty_av = new VariantBuilder (new VariantType ("av"));
+                var panel = new Variant ("(sav)", "online-accounts", empty_av);
+                var parameter = new VariantBuilder (new VariantType ("av"));
+                parameter.add ("v", panel);
+                var platform = new VariantBuilder (new VariantType ("a{sv}"));
+                var args = new Variant.tuple ({
+                    new Variant.string ("launch-panel"),
+                    parameter.end (),
+                    platform.end ()
+                });
+                proxy.call_sync ("Activate", args, DBusCallFlags.NONE, -1, null);
+                return true;
+            } catch (Error e) {
+                debug ("Could not open Online Accounts via %s: %s", bus_name, e.message);
+            }
+        }
+        return false;
+    }
+
+    public static void launch_desktop (string desktop_id) {
+        var bus_name = desktop_id.has_suffix (".desktop")
+            ? desktop_id[0:desktop_id.length - ".desktop".length]
+            : desktop_id;
+        if (activate_session_application (bus_name))
+            return;
+
+        var info = new DesktopAppInfo (desktop_id);
+        if (info != null) {
+            try {
+                info.launch (null, null);
+                return;
+            } catch (Error e) {
+                debug ("Could not launch %s via desktop file: %s", desktop_id, e.message);
+            }
+        }
+
+        if (running_in_flatpak ()
+            && spawn_host_or_local ({ "gtk-launch", desktop_id }))
+            return;
+
+        warning ("Desktop file %s is not installed", desktop_id);
+    }
+
+    private static bool activate_session_application (string bus_name) {
+        try {
+            var path = "/" + bus_name.replace (".", "/");
+            var proxy = new DBusProxy.for_bus_sync (
+                BusType.SESSION,
+                DBusProxyFlags.NONE,
+                null,
+                bus_name,
+                path,
+                "org.freedesktop.Application",
+                null
+            );
+            var platform = new VariantBuilder (new VariantType ("a{sv}"));
+            proxy.call_sync (
+                "Activate",
+                new Variant.tuple ({ platform.end () }),
+                DBusCallFlags.NONE,
+                -1,
+                null
+            );
+            return true;
+        } catch (Error e) {
+            debug ("Could not activate %s: %s", bus_name, e.message);
+            return false;
+        }
+    }
+
+    private static bool spawn_host_or_local (string[] cmd) {
         try {
             Process.spawn_async (null, cmd, null, SpawnFlags.SEARCH_PATH, null, null);
+            return true;
         } catch (Error e) {
-            warning ("Could not open GNOME Settings: %s", e.message);
+            debug ("Could not spawn %s: %s", cmd[0], e.message);
+        }
+
+        if (!running_in_flatpak ())
+            return false;
+
+        try {
+            var argv = new GenericArray<string> ();
+            argv.add ("flatpak-spawn");
+            argv.add ("--host");
+            foreach (unowned string part in cmd)
+                argv.add (part);
+            Process.spawn_async (
+                null,
+                argv.data,
+                null,
+                SpawnFlags.SEARCH_PATH,
+                null,
+                null
+            );
+            return true;
+        } catch (Error e) {
+            debug ("Could not spawn host %s: %s", cmd[0], e.message);
+            return false;
         }
     }
 
@@ -400,20 +518,6 @@ namespace Mail.Utils {
         }
     }
 
-    public static void launch_desktop (string desktop_id) {
-        var info = new DesktopAppInfo (desktop_id);
-        if (info == null) {
-            warning ("Desktop file %s is not installed", desktop_id);
-            return;
-        }
-
-        try {
-            info.launch (null, null);
-        } catch (Error e) {
-            warning ("Could not launch %s: %s", desktop_id, e.message);
-        }
-    }
-
     public const string NOTIFICATION_SOUND_DEFAULT = "message-new-instant";
 
     private static GSound.Context? sound_context;
@@ -534,18 +638,141 @@ namespace Mail.Utils {
         return null;
     }
 
+    public static bool running_in_flatpak () {
+        var flatpak_id = Environment.get_variable ("FLATPAK_ID");
+        return (flatpak_id != null && flatpak_id.length > 0)
+            || FileUtils.test ("/.flatpak-info", FileTest.IS_REGULAR);
+    }
+
     public static bool has_microsoft365_calendar_backend () {
-        return FileUtils.test (
-            "/usr/lib/evolution-data-server/calendar-backends/libecalbackendmicrosoft365.so",
-            FileTest.EXISTS
+        return eds_plugin_present (
+            "calendar-backends",
+            "libecalbackendmicrosoft365.so"
         );
     }
 
     public static bool has_microsoft365_mail_backend () {
-        return FileUtils.test (
-            "/usr/lib/evolution-data-server/camel-providers/libcamelmicrosoft365.so",
-            FileTest.EXISTS
+        return eds_plugin_present (
+            "camel-providers",
+            "libcamelmicrosoft365.so"
         );
+    }
+
+    /* Host EDS loads Graph backends when evolution-ews is installed. Inside
+     * Flatpak /usr is the runtime, so probe the host via flatpak-spawn. */
+    private static bool eds_plugin_present (string kind, string filename) {
+        foreach (unowned string root in eds_library_roots ()) {
+            var path = Path.build_filename (root, "evolution-data-server", kind, filename);
+            if (path_exists_here_or_on_host (path))
+                return true;
+        }
+        return false;
+    }
+
+    private static string[] eds_library_roots () {
+        return {
+            "/app/lib",
+            "/usr/lib",
+            "/usr/lib64",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib/aarch64-linux-gnu",
+        };
+    }
+
+    private static bool path_exists_here_or_on_host (string path) {
+        if (FileUtils.test (path, FileTest.EXISTS))
+            return true;
+        return running_in_flatpak () && host_path_exists (path);
+    }
+
+    private static bool host_path_exists (string path) {
+        try {
+            string[] argv = { "flatpak-spawn", "--host", "test", "-e", path };
+            int status = 1;
+            Process.spawn_sync (
+                null,
+                argv,
+                null,
+                SpawnFlags.SEARCH_PATH | SpawnFlags.STDOUT_TO_DEV_NULL | SpawnFlags.STDERR_TO_DEV_NULL,
+                null,
+                null,
+                null,
+                out status
+            );
+            return Process.if_exited (status) && Process.exit_status (status) == 0;
+        } catch (Error e) {
+            debug ("Could not probe host path %s: %s", path, e.message);
+            return false;
+        }
+    }
+
+    public static bool has_sushi_previewer () {
+        if (session_bus_name_available ("org.gnome.NautilusPreviewer"))
+            return true;
+        if (running_in_flatpak ())
+            return host_program_installed ("sushi");
+        return program_installed ("sushi");
+    }
+
+    private static bool host_program_installed (string name) {
+        try {
+            string[] argv = { "flatpak-spawn", "--host", "sh", "-c", "command -v \"$1\" >/dev/null", "sh", name };
+            int status = 1;
+            Process.spawn_sync (
+                null,
+                argv,
+                null,
+                SpawnFlags.SEARCH_PATH | SpawnFlags.STDOUT_TO_DEV_NULL | SpawnFlags.STDERR_TO_DEV_NULL,
+                null,
+                null,
+                null,
+                out status
+            );
+            return Process.if_exited (status) && Process.exit_status (status) == 0;
+        } catch (Error e) {
+            debug ("Could not probe host program %s: %s", name, e.message);
+            return false;
+        }
+    }
+
+    public static bool session_bus_name_available (string name) {
+        try {
+            var conn = Bus.get_sync (BusType.SESSION, null);
+            var owned = conn.call_sync (
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                new Variant ("(s)", name),
+                new VariantType ("(b)"),
+                DBusCallFlags.NONE,
+                -1,
+                null
+            );
+            bool has_owner = owned.get_child_value (0).get_boolean ();
+            if (has_owner)
+                return true;
+
+            var listed = conn.call_sync (
+                "org.freedesktop.DBus",
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "ListActivatableNames",
+                null,
+                new VariantType ("(as)"),
+                DBusCallFlags.NONE,
+                -1,
+                null
+            );
+            var names = listed.get_child_value (0).get_strv ();
+            foreach (unowned string entry in names) {
+                if (entry == name)
+                    return true;
+            }
+        } catch (Error e) {
+            debug ("Could not query session bus for %s: %s", name, e.message);
+        }
+        return false;
     }
 
     public static GenericArray<string> spell_language_codes () {
@@ -605,7 +832,10 @@ namespace Mail.Utils {
         for (uint i = 0; i < languages.length; i++) {
             var code = languages[i].replace ("-", "_");
             foreach (unowned string root in roots) {
-                if (FileUtils.test (Path.build_filename (root, code + ".dic"), FileTest.IS_REGULAR))
+                var path = Path.build_filename (root, code + ".dic");
+                if (FileUtils.test (path, FileTest.IS_REGULAR))
+                    return true;
+                if (running_in_flatpak () && host_path_exists (path))
                     return true;
             }
         }
@@ -1262,12 +1492,15 @@ namespace Mail.Utils {
 
         for (uint i = 0; i < recipients.length; i++) {
             var recipient = recipients[i];
-            var email = sanitize_recipient_text (recipient.email).down ();
-            if (email.length == 0 || skip.contains (email) || seen.contains (email))
+            var normalized = normalize_sendable_recipient (recipient);
+            if (normalized == null)
+                continue;
+            var email = sanitize_recipient_text (normalized.email).down ();
+            if (skip.contains (email) || seen.contains (email))
                 continue;
 
             seen.add (email);
-            parts.add (format_recipient (recipient));
+            parts.add (format_recipient (normalized));
         }
     }
 
@@ -1708,20 +1941,45 @@ namespace Mail.Utils {
     }
 
     private static void add_recipient_to_address (Camel.InternetAddress address, Recipient recipient) {
+        var normalized = normalize_sendable_recipient (recipient);
+        if (normalized == null)
+            return;
+        var email = sanitize_recipient_text (normalized.email);
+        var name = sanitize_recipient_text (normalized.name);
+        if (name.length == 0 || name.down () == email.down () || name.contains ("@"))
+            address.add ("", email);
+        else
+            address.add (name, email);
+    }
+
+    /* Require a real SMTP address — display names alone (common after Reply-All
+     * / autocomplete) must never become Camel recipients. Graph then “accepts”
+     * the send while nobody is delivered to. */
+    public static Recipient? normalize_sendable_recipient (Recipient? recipient) {
+        if (recipient == null)
+            return null;
+
         var email = sanitize_recipient_text (recipient.email);
         var name = sanitize_recipient_text (recipient.name);
         if (email.length == 0 && name.contains ("@")) {
             email = name;
             name = "";
         }
-        if (email.length == 0 && name.length == 0)
-            return;
-        if (email.length == 0)
-            address.add ("", name);
-        else if (name.length == 0 || name.down () == email.down () || name.contains ("@"))
-            address.add ("", email);
-        else
-            address.add (name, email);
+        if (email.has_prefix ("mailto:"))
+            email = email.substring (7).strip ();
+        if (email.has_prefix ("<") && email.has_suffix (">") && email.length > 2)
+            email = email.substring (1, email.length - 2).strip ();
+
+        var at = email.index_of_char ('@');
+        if (at <= 0 || at >= email.length - 1)
+            return null;
+        if (email.contains (" ") || !email.substring (at + 1).contains ("."))
+            return null;
+
+        return new Recipient () {
+            name = name.contains ("@") ? "" : name,
+            email = email,
+        };
     }
 
     private static string quote_unquoted_angle_names (string raw) {
@@ -1826,6 +2084,15 @@ namespace Mail.Utils {
 
     public static bool is_sendable (Account account) {
         return account.kind != AccountKind.LOCAL && account.source_uid != null && account.has_mail;
+    }
+
+    public static bool is_cancelled_error (Error error) {
+        if (error is IOError.CANCELLED)
+            return true;
+        var down = (error.message ?? "").down ();
+        return down.contains ("cancel")
+            || down.contains ("annullat")
+            || down.contains ("abgebrochen");
     }
 
     public static string friendly_send_error (Error error) {

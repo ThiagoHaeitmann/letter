@@ -3,6 +3,7 @@ public class Mail.Application : Adw.Application {
     public ContactStore contacts { get; private set; }
     public CalendarStore calendars { get; private set; }
     public Notifier notifier { get; private set; }
+    public OutboxStore? outbox { get; set; }
     public bool shutting_down { get; private set; }
 
     private Settings settings;
@@ -308,6 +309,10 @@ public class Mail.Application : Adw.Application {
         }
 
         this.shutting_down = true;
+        var mail = main_window ();
+        if (mail != null)
+            yield mail.prepare_quit ();
+
         var windows = new GenericArray<Gtk.Window> ();
         foreach (var window in get_windows ())
             windows.add (window);

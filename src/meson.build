@@ -40,6 +40,7 @@ mail_sources = files(
   'message-window.vala',
   'attachment-chip.vala',
   'compose-dialog.vala',
+  'outbox-store.vala',
   'recipient-editor.vala',
   'search-query.vala',
   'search-field.vala',

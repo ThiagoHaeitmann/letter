@@ -1,5 +1,6 @@
 public class Mail.ComposeWindow : Adw.ApplicationWindow {
     private const int64 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+    private const uint DRAFT_AUTOSAVE_SECONDS = 120;
 
     private Settings settings;
     private MailSession session;
@@ -30,6 +31,9 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
     private bool attachment_offer_done;
     private GenericSet<string> original_participants = new GenericSet<string> (str_hash, str_equal);
     private uint signature_index;
+    private string compose_id;
+    private uint autosave_source;
+    private bool autosave_notified;
     private string initial_to;
     private string initial_cc;
     private string initial_bcc;
@@ -71,6 +75,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         this.signature_store = new SignatureStore (settings);
         this.signature_store.migrate_if_needed (store);
         this.session = session;
+        this.compose_id = OutboxStore.new_id ();
         this.editing_draft = editing_draft;
         this.editing_draft_folder = editing_draft_folder;
         this.editing_draft_account = selected;
@@ -250,6 +255,109 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
 
         close_request.connect (on_close_request);
         update_send_sensitive ();
+        start_autosave_timer ();
+    }
+
+    public void adopt_compose_id (string id) {
+        if (id == null || id.length == 0)
+            return;
+        this.compose_id = id;
+    }
+
+    public void set_thread_parent (MessageContent? thread) {
+        this.thread_of = thread;
+    }
+
+    public void attach_pending_files (GenericArray<Attachment> files) {
+        for (uint i = 0; i < files.length; i++) {
+            var source = files[i];
+            if (already_has_attachment (source))
+                continue;
+            this.attachments.add (new Attachment () {
+                filename = source.filename,
+                mime_type = source.mime_type,
+                data = source.data,
+                file = source.file,
+            });
+        }
+        this.initial_attachment_count = this.attachments.length;
+        refresh_attachment_chips ();
+    }
+
+    public async void seed_autosave () {
+        this.body_mutated = true;
+        yield autosave_now ();
+    }
+
+    private void start_autosave_timer () {
+        if (this.autosave_source != 0)
+            Source.remove (this.autosave_source);
+        this.autosave_source = Timeout.add_seconds (DRAFT_AUTOSAVE_SECONDS, () => {
+            autosave_now.begin ();
+            return Source.CONTINUE;
+        });
+    }
+
+    private void stop_autosave_timer () {
+        if (this.autosave_source == 0)
+            return;
+        Source.remove (this.autosave_source);
+        this.autosave_source = 0;
+    }
+
+    private OutboxStore? outbox_store () {
+        var app = get_application () as Application;
+        return app != null ? app.outbox : null;
+    }
+
+    private async void autosave_now () {
+        if (this.sending || this.force_close || this.prompting)
+            return;
+        var account = selected_account ();
+        if (account == null)
+            return;
+
+        string plain;
+        string html;
+        try {
+            yield this.body_view.get_bodies (out plain, out html);
+        } catch (Error e) {
+            return;
+        }
+
+        this.to_row.commit_pending ();
+        this.cc_row.commit_pending ();
+        this.bcc_row.commit_pending ();
+        if (!is_dirty_headers () && !this.body_mutated && plain == this.initial_body)
+            return;
+        if (!has_draft_worthy_content (plain))
+            return;
+
+        try {
+            yield save_draft_to_folder ();
+            if (!this.autosave_notified) {
+                this.autosave_notified = true;
+                this.toast_overlay.add_toast (new Adw.Toast (_("Saved to Drafts")) {
+                    timeout = 3,
+                });
+            }
+        } catch (Error e) {
+            debug ("Compose draft autosave failed: %s", e.message);
+        }
+    }
+
+    private bool has_draft_worthy_content (string plain) {
+        if (this.to_row.text.strip ().length > 0)
+            return true;
+        if (this.cc_row.text.strip ().length > 0)
+            return true;
+        if (this.bcc_row.text.strip ().length > 0)
+            return true;
+        if (this.subject_row.text.strip ().length > 0)
+            return true;
+        if (this.attachments.length > 0)
+            return true;
+        return plain.strip ().length > 0;
     }
 
     private static MessageContent? thread_parent_for_compose (
@@ -310,6 +418,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         }
 
         if (!is_dirty_headers () && !this.body_mutated && body == this.initial_body) {
+            stop_autosave_timer ();
             this.force_close = true;
             this.prompting = false;
             close ();
@@ -545,6 +654,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         if (response == "save") {
             try {
                 yield save_draft ();
+                stop_autosave_timer ();
                 this.force_close = true;
                 close ();
             } catch (Error e) {
@@ -553,12 +663,18 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
                 });
             }
         } else if (response == "discard") {
+            stop_autosave_timer ();
+            yield finish_editing_draft (null, null, null);
             this.force_close = true;
             close ();
         }
     }
 
     private async void save_draft () throws Error {
+        yield save_draft_to_folder ();
+    }
+
+    private async void save_draft_to_folder () throws Error {
         var account = selected_account ();
         if (account == null) {
             throw new IOError.FAILED (_("This account has no sending identity."));
@@ -570,6 +686,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         string plain;
         string html;
         yield this.body_view.get_bodies (out plain, out html);
+        Folder? drafts_folder;
         var saved = yield this.session.save_draft (
             account,
             this.to_row.text,
@@ -579,9 +696,15 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
             html,
             this.bcc_row.text,
             this.attachments,
-            this.thread_of
+            this.thread_of,
+            this.is_forward,
+            null,
+            this.editing_draft?.uid,
+            this.editing_draft_folder,
+            out drafts_folder
         );
-        yield finish_editing_draft (account, saved);
+        yield finish_editing_draft (account, saved, drafts_folder);
+        this.body_mutated = false;
         yield remember_clean_state ();
     }
 
@@ -600,6 +723,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
     private async void save_draft_now () {
         try {
             yield save_draft ();
+            this.autosave_notified = true;
             this.toast_overlay.add_toast (new Adw.Toast (_("Saved to Drafts")) {
                 timeout = 3,
             });
@@ -650,6 +774,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         var cc_recipients = this.cc_row.recipients ();
         var session = this.session;
         var app = get_application () as Application;
+        var store = outbox_store ();
 
         try {
             session.ensure_can_send (account, to, cc, bcc);
@@ -662,78 +787,84 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
             return;
         }
 
-        this.force_close = true;
-        persist_size ();
-        close ();
+        if (store == null) {
+            this.sending = false;
+            this.send_button.sensitive = true;
+            this.toast_overlay.add_toast (new Adw.Toast (_("Mail is not ready to send yet.")) {
+                timeout = 5,
+            });
+            return;
+        }
 
+        /* Persist to the local Outbox before closing so a crash mid-send
+         * never loses the message. The Outbox pump sends on its own path. */
         try {
-            yield session.send_message (
+            yield store.enqueue_outbox (
                 account,
                 to,
                 cc,
+                bcc,
                 subject,
                 plain,
                 html,
-                bcc,
-                attachments,
+                this.is_forward,
                 thread_of,
-                null,
-                this.is_forward
+                attachments
             );
-            yield replace_editing_draft ();
-            app?.contacts.remember_recipients (to_recipients);
-            app?.contacts.remember_recipients (cc_recipients);
-        } catch (Error e) {
-            var message = Utils.friendly_send_error (e);
-            try {
-                var saved = yield session.save_draft (
-                    account,
-                    to,
-                    cc,
-                    subject,
-                    plain,
-                    html,
-                    bcc,
-                    attachments,
-                    thread_of,
-                    this.is_forward
-                );
-                yield finish_editing_draft (account, saved);
-                app?.show_mail_toast (
-                    "%s %s".printf (message, _("The message was saved to Drafts."))
-                );
-            } catch (Error save_error) {
-                app?.show_mail_toast (message);
-            }
+        } catch (Error enqueue_error) {
+            this.sending = false;
+            this.send_button.sensitive = true;
+            this.toast_overlay.add_toast (new Adw.Toast (enqueue_error.message) {
+                timeout = 5,
+            });
+            return;
         }
+
+        stop_autosave_timer ();
+        yield replace_editing_draft ();
+        app?.contacts.remember_recipients (to_recipients);
+        app?.contacts.remember_recipients (cc_recipients);
+
+        this.force_close = true;
+        persist_size ();
+        close ();
+        store.request_send_now ();
+        app?.show_mail_toast (_("Queued in Outbox"));
     }
 
     private async void replace_editing_draft () {
-        yield finish_editing_draft (null, null);
+        yield finish_editing_draft (null, null, null);
     }
 
-    private async void finish_editing_draft (Account? account, Message? replacement) {
+    private async void finish_editing_draft (Account? account, Message? replacement, Folder? replacement_folder) {
+        if (replacement != null) {
+            this.editing_draft = replacement;
+            this.editing_draft_folder = replacement_folder ?? this.editing_draft_folder;
+            this.editing_draft_account = account ?? this.editing_draft_account ?? selected_account ();
+            return;
+        }
+
         var draft = this.editing_draft;
         var folder = this.editing_draft_folder;
         var owner = account ?? this.editing_draft_account ?? selected_account ();
         if (draft != null && folder != null && owner != null
-            && draft.uid != null && draft.uid.length > 0
-            && (replacement == null || replacement.uid != draft.uid)) {
+            && draft.uid != null && draft.uid.length > 0) {
             try {
+                /* Server-side purge — local-only delete left Drafts full on M365. */
                 yield this.session.delete_message (owner, folder, draft.uid, null);
             } catch (Error e) {
-                warning ("Could not remove replaced draft: %s", e.message);
+                warning ("Could not remove draft: %s", e.message);
+                try {
+                    yield this.session.delete_message_local (owner, folder, draft.uid);
+                } catch (Error local_error) {
+                    warning ("Could not remove draft locally: %s", local_error.message);
+                }
             }
         }
 
-        if (replacement != null) {
-            this.editing_draft = replacement;
-            this.editing_draft_account = owner;
-        } else {
-            this.editing_draft = null;
-            this.editing_draft_folder = null;
-            this.editing_draft_account = null;
-        }
+        this.editing_draft = null;
+        this.editing_draft_folder = null;
+        this.editing_draft_account = null;
     }
 
     private Gtk.Widget build_toolbar () {
@@ -1774,6 +1905,31 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         if (parts[0] == "delete") {
             this.current_image_id = parts[1];
             delete_stored_image (parts[1]);
+            return;
+        }
+        if (payload.has_prefix ("pasteimg|"))
+            handle_paste_image (payload);
+    }
+
+    private void handle_paste_image (string payload) {
+        var rest = payload.substring ("pasteimg|".length);
+        var sep = rest.index_of_char ('|');
+        if (sep <= 0 || sep >= rest.length - 1)
+            return;
+        var mime = rest.substring (0, sep).strip ();
+        var b64 = rest.substring (sep + 1)
+            .replace ("\n", "")
+            .replace ("\r", "")
+            .replace (" ", "");
+        if (mime.length == 0 || !mime.has_prefix ("image/"))
+            mime = "image/png";
+        var raw = Base64.decode (b64);
+        if (raw.length == 0)
+            return;
+        try {
+            insert_image (new Bytes (raw), mime, _("Pasted image"));
+        } catch (Error e) {
+            debug ("Could not insert pasted image: %s", e.message);
         }
     }
 
@@ -3182,6 +3338,79 @@ blockquote:not(.mail-quote) {
                         e.stopPropagation();
                         selectImage(e.target);
                     }
+                });
+
+                /* Clipboard screenshots (GNOME Ctrl+V) arrive as image/* items or
+                 * as blob:/data: <img> nodes. Route them through Vala insert_image
+                 * so send can turn them into CID MIME parts. */
+                function pasteDataUrl(dataUrl, fallbackMime) {
+                    var comma = dataUrl.indexOf(',');
+                    if (comma < 0)
+                        return;
+                    var header = dataUrl.slice(0, comma);
+                    var b64 = dataUrl.slice(comma + 1);
+                    var mime = fallbackMime || 'image/png';
+                    var match = /data:(image\/[a-zA-Z0-9.+-]+)/.exec(header);
+                    if (match)
+                        mime = match[1];
+                    postCompose('pasteimg|' + mime + '|' + b64);
+                }
+
+                function harvestOrphanImages() {
+                    var imgs = editor.querySelectorAll('img:not([data-mail-id])');
+                    for (var i = 0; i < imgs.length; i++) {
+                        var img = imgs[i];
+                        if (closest(img, '.mail-quote, .mail-signature'))
+                            continue;
+                        var src = img.getAttribute('src') || '';
+                        if (src.indexOf('data:image/') === 0) {
+                            img.parentNode && img.parentNode.removeChild(img);
+                            pasteDataUrl(src, null);
+                        } else if (src.indexOf('blob:') === 0) {
+                            (function (node, blobUrl) {
+                                fetch(blobUrl).then(function (res) { return res.blob(); }).then(function (blob) {
+                                    var reader = new FileReader();
+                                    reader.onload = function () {
+                                        if (node.parentNode)
+                                            node.parentNode.removeChild(node);
+                                        pasteDataUrl(String(reader.result), blob.type || 'image/png');
+                                    };
+                                    reader.readAsDataURL(blob);
+                                }).catch(function () {});
+                            })(img, src);
+                        }
+                    }
+                }
+
+                editor.addEventListener('paste', function (e) {
+                    if (inLockedRegion())
+                        return;
+                    var clipboard = e.clipboardData;
+                    if (!clipboard)
+                        return;
+                    var items = clipboard.items;
+                    var handled = false;
+                    if (items) {
+                        for (var i = 0; i < items.length; i++) {
+                            if (!items[i].type || items[i].type.indexOf('image/') !== 0)
+                                continue;
+                            e.preventDefault();
+                            handled = true;
+                            var file = items[i].getAsFile();
+                            if (!file)
+                                continue;
+                            (function (blob) {
+                                var reader = new FileReader();
+                                reader.onload = function () {
+                                    pasteDataUrl(String(reader.result), blob.type || 'image/png');
+                                };
+                                reader.readAsDataURL(blob);
+                            })(file);
+                            break;
+                        }
+                    }
+                    if (!handled)
+                        setTimeout(harvestOrphanImages, 0);
                 });
 
                 document.addEventListener('pointerdown', function (e) {

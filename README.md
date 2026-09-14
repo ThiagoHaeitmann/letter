@@ -10,7 +10,7 @@ This is not a GNOME Core application, but it follows the clean GNOME 50 look and
 
 Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 
-**1.0.0-rc.2** is the current release candidate toward 1.0. It is meant for daily use: reading, composing, search, notifications, and cache-first sync are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. This RC gathers feedback before **1.0.0**.
+**1.0.0-rc.3** is the current release candidate toward 1.0. It is meant for daily use: reading, composing, search, notifications, and cache-first sync are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. This RC gathers feedback before **1.0.0**.
 
 ### Available languages
 
@@ -19,13 +19,16 @@ Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 - German (translation by [Christian Lauinger](https://github.com/ChrisLauinger77))
 - More will come — translations via pull request are very welcome.
 
+
+
 ## What the current version does:
+
+
 
 ### Accounts and desktop integration
 
 - Discovers Google, Microsoft 365, Exchange, IMAP/SMTP from GNOME Online Accounts and Evolution Data Server
 - No second account wizard and no local unnecessary “On this computer” mailbox
-- First-run welcome that explains the design and the Online Accounts requirement
 - Account rail with provider icons and fast switch between the enabled email accounts
 - Per-account HTML multi-signatures, with a starred default for new messages
 
@@ -50,8 +53,9 @@ Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 - After the first full sync, Letter prefers the **local cache** for folder lists, headers, bookmarks, and unread badges so the UI stays responsive
 - Opening a folder reads from cache; the server is checked on the interval you set in Preferences (and when you refresh), not on every click
 - At startup and on each sync cycle, Letter still probes non-Inbox folders lightly: empty lists that have mail on the server, or lists whose remote counts drifted (for example mail filed from a phone)
-- Flag, bookmark, and similar changes update the UI immediately and are pushed to the server on the next sync cycle
-- Sending mail goes out right away; it does not force a full mailbox refresh
+- Archive, trash, move, and flag changes update the UI immediately; the server push waits for the sync timer, F5, startup, or quit (so Send stays responsive)
+- Pending soft changes survive a quit, crash or offline working in a small on-disk registry and flush on the next start
+- Sending uses a virtual **Outbox** (retry / edit / cancel); compose autosaves to **Drafts** every two minutes
 
 
 
@@ -102,7 +106,7 @@ You must add at least one email account in **Settings → Online Accounts**. IMA
 | Sushi                                     | Quick attachment preview; otherwise Letter opens the default viewer app |
 
 
-If you use a Microsoft 365 or Exchange account, you need evolution-ews package. To install it use one of the following command according to your distribution package manager:
+If you use a Microsoft 365 or Exchange account, you need the `evolution-ews` package for Graph mail (and for calendar/contacts on the host). Distro install:
 
 ```
 Arch Linux
@@ -114,6 +118,8 @@ sudo apt install evolution-ews
 Fedora
 sudo dnf install evolution-ews
 ```
+
+The **Flatpak bundle** already includes the Graph **mail** Camel provider. You still want host `evolution-ews` if Calendar/Contacts on the desktop should use the same Microsoft account.
 
 `evolution-ews` currently depends on the Evolution *package* because a plugin links Evolution’s UI libraries. You do not need to *run* Evolution aaplication and just right now there is no way to safely uninstall Evolution itself.  Leave it closed so only Letter downloads messages. You can hide Evolution app from app drawer by overriding .desktop file. If you have standard repository app, you can use this command in your terminal:
 
@@ -127,13 +133,13 @@ Tip: Use the **Microsoft 365** (Graph) account type, not classic Exchange Web Se
 
 ## Install
 
-There is no Flathub listing and no distro package yet. For **1.0.0-rc.2**, download the **Flatpak bundle** from the [GitHub Releases](https://github.com/stalvatero/letter/releases) page (file named like `Letter-1.0.0-rc.2-x86_64.flatpak`).
+There is no Flathub listing and no distro package yet. For **1.0.0-rc.3**, download the **Flatpak bundle** from the [GitHub Releases](https://github.com/stalvatero/letter/releases) page (file named like `Letter-1.0.0-rc.3-x86_64.flatpak`).
 
 Letter needs the **GNOME Platform 50** runtime from Flathub. Add the Flathub remote once (if it is not already configured), then install the downloaded file:
 
 ```sh
 flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user ~/Downloads/Letter-1.0.0-rc.2-x86_64.flatpak
+flatpak install --user ~/Downloads/Letter-1.0.0-rc.3-x86_64.flatpak
 ```
 
 Adjust the path to wherever you saved the `.flatpak`. Flatpak will download **org.gnome.Platform//50** from Flathub on first install if it is missing.
@@ -153,6 +159,8 @@ Download the newer `.flatpak` from [Releases](https://github.com/stalvatero/lett
 ```sh
 flatpak install --user ~/Downloads/Letter-….flatpak
 ```
+
+
 
 ## Uninstall
 

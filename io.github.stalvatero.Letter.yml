@@ -1,6 +1,8 @@
-# Flatpak manifest for Letter 1.0.0-rc.2 (bundle / GitHub Releases; not Flathub yet).
+# Flatpak manifest for Letter (bundle / GitHub Releases; not Flathub yet).
 # Build libraries for GOA / EDS / Camel into the sandbox; talk to the host
 # Online Accounts and EDS daemons over D-Bus (same pattern as Geary).
+# evolution-ews is bundled so Camel can open microsoft365:// stores in-process
+# (host evolution-ews alone is not visible inside the sandbox).
 #
 # Quick test (from the repo root):
 #   ./scripts/build-flatpak.sh
@@ -11,6 +13,9 @@ runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
 command: letter
+# Keep .mo inside the app so single-file .flatpak bundles are translated
+# without a separate Locale extension.
+separate-locales: false
 
 finish-args:
   - --share=ipc
@@ -21,10 +26,14 @@ finish-args:
   - --share=network
   - --system-talk-name=org.freedesktop.login1
   - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.Flatpak
   - --talk-name=org.gnome.ControlCenter
+  - --talk-name=org.gnome.Settings
   - --talk-name=org.gnome.OnlineAccounts
   - --talk-name=org.gnome.evolution.dataserver.*
+  - --talk-name=org.gnome.Calendar
   - --talk-name=org.gnome.Contacts
+  - --talk-name=org.gnome.NautilusPreviewer
   - --filesystem=~/.cache/evolution:ro
   - --filesystem=xdg-download:rw
   - --filesystem=/tmp
@@ -45,6 +54,8 @@ cleanup:
   - '*.a'
 
 modules:
+  - flatpak/shared-modules/intltool/intltool-0.51.json
+
   - name: rest
     buildsystem: meson
     config-opts:
@@ -106,9 +117,68 @@ modules:
         sha256: da136d1190d9e8b09499452f6058e24eee6b77f441a8c769f74a52451bf379f1
     cleanup:
       - /lib/cmake
+      # Host EDS still owns calendar/addressbook factories; keep client libs only.
       - /lib/evolution-data-server/*-backends
       - /libexec
       - /share/dbus-1/services
+
+  # Minimal Evolution shell libs — required to build evolution-ews (Camel Graph).
+  # Stripped from /bin after ews; users never launch Evolution from this Flatpak.
+  - name: evolution
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DENABLE_AUTOAR=OFF
+      - -DENABLE_CANBERRA=OFF
+      - -DENABLE_CONTACT_MAPS=OFF
+      - -DENABLE_GNOME_DESKTOP=OFF
+      - -DENABLE_GSPELL=OFF
+      - -DENABLE_GTK_DOC=OFF
+      - -DENABLE_INSTALLED_TESTS=OFF
+      - -DENABLE_PST_IMPORT=OFF
+      - -DENABLE_TEXT_HIGHLIGHT=OFF
+      - -DENABLE_WEATHER=OFF
+      - -DENABLE_YTNEF=OFF
+      - -DENABLE_MARKDOWN=OFF
+      - -DWITH_GLADE_CATALOG=OFF
+      - -DWITH_HELP=OFF
+      - -DWITH_OPENLDAP=OFF
+      - -DWITH_STATIC_LDAP=OFF
+      - -DWITH_BOGOFILTER=OFF
+      - -DWITH_SA_LEARN=OFF
+      - -DWITH_SPAMASSASSIN=OFF
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/evolution/3.58/evolution-3.58.3.tar.xz
+        sha256: 5d01b79a5bebdf2d3a9871b61350939cf2501f6ea03c241543f744a9286d4d79
+
+  - name: libmspack
+    cleanup:
+      - /bin
+    sources:
+      - type: archive
+        url: https://deb.debian.org/debian/pool/main/libm/libmspack/libmspack_0.11.orig.tar.gz
+        sha256: 70dd1fb2f0aecc36791b71a1e1840e62173079eadaa081192d1c323a0eeea21b
+
+  - name: evolution-ews
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DWITH_MSPACK=ON
+      - -DENABLE_TESTS=OFF
+    sources:
+      - type: archive
+        url: https://download.gnome.org/sources/evolution-ews/3.58/evolution-ews-3.58.3.tar.xz
+        sha256: 3f6ef8bb6389013e843e258ce1dc317a891a34f87d79780c9aef04d2741abc92
+    # Drop Evolution UI leftovers now that Graph/EWS providers are installed.
+    cleanup:
+      - /bin
+      - /share/applications
+      - /share/metainfo
+      - /share/dbus-1
+      - /share/evolution
+      - /share/GConf
+      - /share/man
 
   - name: libcanberra
     config-opts:
@@ -140,6 +210,14 @@ modules:
       - type: archive
         url: https://download.gnome.org/sources/gsound/1.0/gsound-1.0.3.tar.xz
         sha256: ca2d039e1ebd148647017a7f548862350bc9af01986d39f10cfdc8e95f07881a
+
+  # GNOME Platform does not ship XDG sound themes; without this GSound fails
+  # with “File or data not found” for message-new-instant (and Preferences preview).
+  - name: sound-theme-freedesktop
+    sources:
+      - type: archive
+        url: https://people.freedesktop.org/~mccann/dist/sound-theme-freedesktop-0.8.tar.bz2
+        sha256: cb518b20eef05ec2e82dda1fa89a292c1760dc023aba91b8aa69bafac85e8a14
 
   - name: letter
     buildsystem: meson

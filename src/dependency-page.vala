@@ -26,9 +26,12 @@ public class Mail.DependencyListPage : Adw.NavigationPage {
         Object (title: _("Dependencies"));
 
         var header = new Adw.HeaderBar ();
-        var intro = new Gtk.Label (
-            _("Letter is made for the GNOME desktop from version 50 onward and makes full use of the GTK 4 and libadwaita libraries. A normal GNOME installation already includes everything needed to make it work. Check the essential packages below, and the optional ones only if you need them.")
-        ) {
+        var intro_text = _("Letter is made for the GNOME desktop from version 50 onward and makes full use of the GTK 4 and libadwaita libraries. A normal GNOME installation already includes everything needed to make it work. Check the essential packages below, and the optional ones only if you need them.");
+        if (Utils.running_in_flatpak ()) {
+            intro_text += "\n\n"
+                + _("You are running the Flatpak build. Recommended packages are installed on the host system (outside the sandbox); Letter checks the host for them.");
+        }
+        var intro = new Gtk.Label (intro_text) {
             wrap = true,
             xalign = 0,
             max_width_chars = 56,
@@ -108,10 +111,15 @@ public class Mail.DependencyListPage : Adw.NavigationPage {
 
     private static GenericArray<SystemPackage> recommended_packages () {
         var listed = new GenericArray<SystemPackage> ();
+        var flatpak = Utils.running_in_flatpak ();
         listed.add (package (
             _("Microsoft Graph backends"),
-            _("evolution-ews for Microsoft 365 mail, calendar, and contacts"),
-            Utils.has_microsoft365_calendar_backend () && Utils.has_microsoft365_mail_backend (),
+            flatpak
+                ? _("Graph mail is bundled in this Flatpak. Install evolution-ews on the host if you also want Microsoft 365 calendar and contacts via the desktop.")
+                : _("evolution-ews for Microsoft 365 mail, calendar, and contacts"),
+            flatpak
+                ? Utils.has_microsoft365_mail_backend ()
+                : Utils.has_microsoft365_calendar_backend () && Utils.has_microsoft365_mail_backend (),
             "evolution-ews",
             "evolution-ews",
             "evolution-ews"
@@ -119,7 +127,9 @@ public class Mail.DependencyListPage : Adw.NavigationPage {
 
         var spell = package (
             _("Hunspell"),
-            _("Spell checking in the compose editor. Install Hunspell plus a dictionary for your language."),
+            flatpak
+                ? _("Spell checking in the compose editor. Install Hunspell and a dictionary for your language on the host.")
+                : _("Spell checking in the compose editor. Install Hunspell plus a dictionary for your language."),
             Utils.hunspell_dictionaries_present (),
             "hunspell",
             "hunspell",
@@ -130,8 +140,10 @@ public class Mail.DependencyListPage : Adw.NavigationPage {
 
         listed.add (package (
             _("Sushi"),
-            _("Quick attachment preview. Without it, Letter opens the file in the default application."),
-            Utils.program_installed ("sushi"),
+            flatpak
+                ? _("Quick attachment preview via the host Sushi / Nautilus Previewer. Without it, Letter opens the file in the default application.")
+                : _("Quick attachment preview. Without it, Letter opens the file in the default application."),
+            Utils.has_sushi_previewer (),
             "gnome-sushi",
             "sushi",
             "sushi"

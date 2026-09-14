@@ -252,14 +252,15 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
     }
 
     public void add_recipient (Recipient recipient) {
-        var email = Utils.sanitize_recipient_text (recipient.email).down ();
-        if (email.length == 0 || !email.contains ("@"))
+        var normalized = Utils.normalize_sendable_recipient (recipient);
+        if (normalized == null)
             return;
+        var email = Utils.sanitize_recipient_text (normalized.email).down ();
         for (uint i = 0; i < this.chips.length; i++) {
             if (Utils.sanitize_recipient_text (this.chips[i].recipient.email).down () == email)
                 return;
         }
-        add_chip (recipient, true);
+        add_chip (normalized, true);
     }
 
     public void commit_pending () {
@@ -267,8 +268,11 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
     }
 
     private void add_chip (Recipient recipient, bool notify) {
+        var normalized = Utils.normalize_sendable_recipient (recipient);
+        if (normalized == null)
+            return;
         var chip = new Chip ();
-        chip.recipient = recipient;
+        chip.recipient = normalized;
         chip.widget = make_chip_widget (recipient);
         chip.holder = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 0) {
             hexpand = false,
@@ -407,20 +411,27 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
         this.finishing_edit = true;
 
         var parsed = Utils.parse_recipient_list (entry.text);
-        if (parsed.length == 0) {
+        Recipient? first = null;
+        for (uint i = 0; i < parsed.length; i++) {
+            var normalized = Utils.normalize_sendable_recipient (parsed[i]);
+            if (normalized == null)
+                continue;
+            if (first == null)
+                first = normalized;
+            else
+                add_chip (normalized, false);
+        }
+        if (first == null) {
             this.finishing_edit = false;
             remove_chip (chip, true);
             return;
         }
 
         chip.holder.remove (entry);
-        chip.recipient = parsed[0];
+        chip.recipient = first;
         chip.widget = make_chip_widget (chip.recipient);
         chip.holder.append (chip.widget);
         wire_chip (chip);
-
-        for (uint i = 1; i < parsed.length; i++)
-            add_chip (parsed[i], false);
 
         this.finishing_edit = false;
         this.selected_chip = null;
@@ -459,11 +470,22 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
         if (parsed.length == 0)
             return;
 
-        this.input.text = "";
+        var leftover = new StringBuilder ();
+        for (uint i = 0; i < parsed.length; i++) {
+            var normalized = Utils.normalize_sendable_recipient (parsed[i]);
+            if (normalized == null) {
+                if (leftover.len > 0)
+                    leftover.append (", ");
+                leftover.append (Utils.format_recipient (parsed[i]));
+                continue;
+            }
+            add_recipient (normalized);
+        }
+        this.input.text = leftover.str;
         hide_suggest ();
-        for (uint i = 0; i < parsed.length; i++)
-            add_chip (parsed[i], false);
         recipients_changed ();
+        if (leftover.len > 0)
+            this.input.grab_focus ();
     }
 
     private void on_input_text () {

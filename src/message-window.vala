@@ -375,18 +375,40 @@ public class Mail.MessageWindow : Adw.ApplicationWindow {
         if (this.folder.full_name == archive.full_name)
             return;
 
-        try {
-            yield this.session.move_message (this.account, this.folder, this.message.uid, archive);
-            folder_changed ();
-            close ();
-        } catch (Error e) {
-            toast (e.message);
-        }
+        var uids = new GenericArray<string> ();
+        uids.add (this.message.uid);
+        this.session.enqueue_move_messages (this.account, this.folder, archive, uids, null);
+        folder_changed ();
+        close ();
     }
 
     private async void trash_message () {
+        var trash = find_kind (FolderKind.TRASH);
+        var permanent = trash == null || this.folder.full_name == trash.full_name
+            || this.folder.kind == FolderKind.JUNK;
+        if (permanent) {
+            var dialog = new Adw.AlertDialog (
+                _("Delete permanently?"),
+                _("This message will be permanently deleted. This cannot be undone.")
+            );
+            dialog.add_response ("cancel", _("Cancel"));
+            dialog.add_response ("delete", _("Delete"));
+            dialog.set_response_appearance ("delete", Adw.ResponseAppearance.DESTRUCTIVE);
+            dialog.default_response = "cancel";
+            dialog.close_response = "cancel";
+            if ((yield dialog.choose (this, null)) != "delete")
+                return;
+        }
+
         try {
-            yield this.session.delete_message (this.account, this.folder, this.message.uid, find_kind (FolderKind.TRASH));
+            var uids = new GenericArray<string> ();
+            uids.add (this.message.uid);
+            yield this.session.delete_uids (
+                this.account,
+                this.folder,
+                uids,
+                permanent ? null : trash
+            );
             folder_changed ();
             close ();
         } catch (Error e) {
@@ -399,13 +421,11 @@ public class Mail.MessageWindow : Adw.ApplicationWindow {
         if (destination == null)
             return;
 
-        try {
-            yield this.session.move_message (this.account, this.folder, this.message.uid, destination);
-            folder_changed ();
-            close ();
-        } catch (Error e) {
-            toast (e.message);
-        }
+        var uids = new GenericArray<string> ();
+        uids.add (this.message.uid);
+        this.session.enqueue_move_messages (this.account, this.folder, destination, uids, null);
+        folder_changed ();
+        close ();
     }
 
     private Folder? find_kind (FolderKind kind) {

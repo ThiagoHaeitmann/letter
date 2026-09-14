@@ -112,6 +112,7 @@ public class Mail.Folder : Object {
     public const uint FLAG_VTRASH = 1 << 7;
     public const uint FLAG_NOINFERIORS = 1 << 1;
     public const string BOOKMARKS_PATH = ":bookmarks";
+    public const string OUTBOX_PATH = ":outbox";
 
     public string name { get; set; }
     public string full_name { get; set; }
@@ -290,7 +291,19 @@ public class Mail.Folder : Object {
 
     public bool is_virtual_view {
         get {
-            return this.kind == FolderKind.BOOKMARKS;
+            return this.full_name == BOOKMARKS_PATH || this.full_name == OUTBOX_PATH;
+        }
+    }
+
+    public bool is_local_outbox {
+        get {
+            return this.full_name == OUTBOX_PATH;
+        }
+    }
+
+    public bool is_bookmarks_view {
+        get {
+            return this.full_name == BOOKMARKS_PATH;
         }
     }
 
@@ -351,6 +364,8 @@ public enum Mail.FolderKind {
     public static FolderKind from_flags (uint flags, string? name, string? full_name) {
         if (full_name == Folder.BOOKMARKS_PATH)
             return BOOKMARKS;
+        if (full_name == Folder.OUTBOX_PATH)
+            return OUTBOX;
 
         uint type = flags & Folder.TYPE_MASK;
         if (type == (1 << 10))

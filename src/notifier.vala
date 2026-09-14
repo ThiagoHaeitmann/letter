@@ -161,8 +161,17 @@ public class Mail.Notifier : Object {
             return;
         }
 
+        /* Flatpak: play in-process. The host notification daemon cannot read
+         * /app/share/sounds/… if we pass sound-file, and theme lookup inside
+         * the sandbox needs the bundled freedesktop theme. */
+        if (Utils.running_in_flatpak ()) {
+            hints.add ("{sv}", "suppress-sound", new Variant.boolean (true));
+            Utils.play_notification_sound (choice);
+            return;
+        }
+
         var path = Utils.notification_sound_filename (choice);
-        if (path != null) {
+        if (path != null && Utils.notification_sound_is_file (choice)) {
             hints.add ("{sv}", "sound-file", new Variant.string (path));
             return;
         }

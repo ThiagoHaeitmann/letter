@@ -85,6 +85,7 @@ public class Mail.Window : Adw.ApplicationWindow {
     private bool selecting_account;
     private Folder? selected_folder;
     private Folder? bookmarks_folder;
+    private Folder? outbox_folder;
     private MessageReader message_reader;
     private Gtk.Box reader_pane;
     private Gtk.Revealer thread_revealer;
@@ -115,7 +116,13 @@ public class Mail.Window : Adw.ApplicationWindow {
     private uint idle_bulk_source;
     private uint idle_bulk_cursor;
     private uint folder_scout_source;
+    private uint folder_scout_cursor;
     private bool folder_scout_running;
+    /* Progressive refresh_info budget for scout-driven bulk aligns. */
+    private HashTable<string, int64?> bulk_refresh_next_allowed;
+    private HashTable<string, int> bulk_refresh_level;
+    private HashTable<string, int64?> tip_refresh_last;
+    private string? body_fill_folder;
     private bool sync_pump_running;
     private bool mailbox_bootstrapping;
     private bool folder_tree_needs_refresh;
@@ -131,6 +138,8 @@ public class Mail.Window : Adw.ApplicationWindow {
     private Gtk.SizeGroup account_header_sizes;
     private Gtk.SizeGroup account_row_sizes;
     private uint sync_status_token;
+    private uint flush_status_source;
+    private uint send_status_token;
     private bool unread_only;
     private bool conversation_view;
     private uint conversation_index_source;
@@ -252,6 +261,9 @@ public class Mail.Window : Adw.ApplicationWindow {
                 this.collapsed_folders.set (key, 1);
         }
         this.notified_uids = new HashTable<string, uint8> (str_hash, str_equal);
+        this.bulk_refresh_next_allowed = new HashTable<string, int64?> (str_hash, str_equal);
+        this.bulk_refresh_level = new HashTable<string, int> (str_hash, str_equal);
+        this.tip_refresh_last = new HashTable<string, int64?> (str_hash, str_equal);
         this.sync_jobs = new GenericArray<MailSyncJob> ();
         this.message_reader = new MessageReader ();
         this.message_reader.set_contacts (app.contacts);
@@ -498,11 +510,15 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (store.registry != null && this.mail_session == null) {
             this.mail_session = new MailSession (store.registry);
             this.mail_session.folder_changed.connect (on_camel_folder_changed);
+            this.mail_session.send_starting.connect (on_send_starting);
+            this.mail_session.send_finished.connect (on_send_finished);
             this.mail_session.message_sent.connect (on_message_sent);
             this.mail_session.draft_saved.connect (on_draft_saved);
             this.mail_session.draft_removed.connect (on_draft_removed);
             this.mail_session.transfer_failed.connect (on_transfer_failed);
             bind_reader_mailbox ();
+            ensure_outbox_store ();
+            restore_mutation_registry ();
         }
 
         /* Warm disk trees into RAM before activating the last account so the
@@ -519,6 +535,35 @@ public class Mail.Window : Adw.ApplicationWindow {
 
     public MailSession? peek_session () {
         return this.mail_session;
+    }
+
+    /* Reload soft moves/flags left on disk from a previous quit/crash and
+     * push them immediately so the next session starts from a clean registry
+     * when the network cooperates. */
+    private void restore_mutation_registry () {
+        if (this.mail_session == null)
+            return;
+        var loaded = this.mail_session.load_mutation_registry ();
+        if (loaded == 0)
+            return;
+        this.mail_session.foreach_queued_move_hide ((account, from, uid) => {
+            this.hidden_uids.set (hide_key (account, from, uid), 1);
+        });
+        watch_local_flush_status ();
+        this.mail_session.flush_pending_local_changes ();
+    }
+
+    /* Best-effort drain before process exit: push pending moves/flags, then
+     * clear the on-disk registry only when RAM queues are empty. Timeout or
+     * offline leaves an accurate leftover file for the next start. */
+    public async void prepare_quit () {
+        commit_pending_transfer_undo ();
+        if (this.mail_session == null)
+            return;
+        this.mail_session.persist_mutation_registry_now ();
+        var ok = yield this.mail_session.flush_pending_local_changes_with_timeout (15);
+        if (!ok)
+            Utils.sync_log ("quit flush incomplete — registry kept for next start");
     }
 
     private void bind_reader_mailbox () {
@@ -589,6 +634,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.idle_cancellable?.cancel ();
         this.idle_cancellable = new Cancellable ();
         this.sync_jobs = new GenericArray<MailSyncJob> ();
+        clear_all_bulk_refresh_backoff ();
 
         if (this.selected_account != null && accounts_are_same (this.selected_account, account))
             load_folders.begin (account);
@@ -760,35 +806,38 @@ public class Mail.Window : Adw.ApplicationWindow {
                     known.set (previous[i].uid, 1);
             }
         }
-        this.message_cache.set (key, messages);
+        /* Always drop locally-hidden (archived/moved pending flush) so Camel
+         * summaries and disk header caches cannot resurrect them. */
+        var visible = visible_messages (account, folder, messages);
+        this.message_cache.set (key, visible);
         touch_message_cache_key (key);
         int total;
         int unread;
-        message_counts (messages, out total, out unread);
+        message_counts (visible, out total, out unread);
         /* An empty *local* summary must not wipe server-derived tree badges
          * (common for Trash on first open before align). Keep prior counts. */
-        if (messages.length > 0 || (folder.total <= 0 && folder.unread <= 0)) {
+        if (visible.length > 0 || (folder.total <= 0 && folder.unread <= 0)) {
             folder.unread = unread;
             folder.total = total;
             refresh_folder_badge (folder);
         }
         if (is_current_folder (folder) && this.search_text.length == 0)
-            display_messages (account, folder, messages);
+            display_messages (account, folder, visible);
         else
             queue_conversation_refresh ();
         sync_bookmarks_folder ();
         sync_important_markers ();
         if (known.length > 0)
-            notify_new_arrivals (account, folder, messages, known);
+            notify_new_arrivals (account, folder, visible, known);
         if (persist_disk)
-            queue_header_list_cache_save (account, folder, messages);
+            queue_header_list_cache_save (account, folder, visible);
         enforce_message_cache_ceiling ();
     }
 
     private bool folder_skips_body_prefetch (Folder folder) {
-        return folder.kind == FolderKind.JUNK
-            || folder.kind == FolderKind.TRASH
-            || folder_is_bulk_storage (folder);
+        /* Preferences body window applies to every real folder (Inbox, Archive,
+         * Sent, Trash, Junk, custom). Only skip virtual UI nodes. */
+        return folder.is_virtual_view || folder.is_gmail_namespace;
     }
 
     /* Bulk storage (Archive/Sent/…) — never auto-walk at startup.
@@ -844,22 +893,40 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         var key = message_cache_key (account, folder);
         var existing = this.message_cache.get (key);
-        if (existing != null && existing.length > 0)
-            return;
-
-        /* Prefer Letter's on-disk header list (instant) over walking Camel's
-         * full summary. Server delta comes later via boost/align. */
-        var from_disk = load_header_list_cache (account, folder);
-        if (from_disk != null && from_disk.length > 0) {
-            var live = this.message_cache.get (key);
-            if (live != null && live.length > 0)
+        if (existing != null && existing.length > 0) {
+            if (!yield headers_lag_camel_summary (account, folder, existing.length, cancellable))
                 return;
-            store_folder_messages (account, folder, from_disk, null, false);
-            Utils.sync_log ("disk header cache hit “%s” → %u headers".printf (
-                folder.name,
-                from_disk.length
-            ));
-            return;
+            Utils.sync_log (
+                "RAM header cache stale “%s” (%u) — rebuilding from Camel".printf (
+                    folder.name,
+                    existing.length
+                )
+            );
+        } else {
+            /* Prefer Letter's on-disk header list (instant) over walking Camel's
+             * full summary — unless that list lags far behind Camel's local UIDs. */
+            var from_disk = load_header_list_cache (account, folder);
+            if (from_disk != null && from_disk.length > 0) {
+                var live = this.message_cache.get (key);
+                if (live != null && live.length > 0) {
+                    if (!yield headers_lag_camel_summary (account, folder, live.length, cancellable))
+                        return;
+                } else {
+                    store_folder_messages (account, folder, from_disk, null, false);
+                    Utils.sync_log ("disk header cache hit “%s” → %u headers".printf (
+                        folder.name,
+                        from_disk.length
+                    ));
+                    if (!yield headers_lag_camel_summary (account, folder, from_disk.length, cancellable))
+                        return;
+                    Utils.sync_log (
+                        "disk header cache stale “%s” (%u) — rebuilding from Camel".printf (
+                            folder.name,
+                            from_disk.length
+                        )
+                    );
+                }
+            }
         }
 
         var t0 = Utils.sync_tick ();
@@ -872,9 +939,6 @@ public class Mail.Window : Adw.ApplicationWindow {
                 is_current_folder (folder)
             );
             if (cancellable.is_cancelled () || !is_current_account (account))
-                return;
-            var live = this.message_cache.get (key);
-            if (live != null && live.length > 0)
                 return;
             store_folder_messages (account, folder, cached);
             Utils.sync_log ("disk hydrate “%s” %s → %u headers".printf (
@@ -894,11 +958,37 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
+    /* True when Letter's header list is far behind Camel's local UID summary. */
+    private async bool headers_lag_camel_summary (
+        Account account,
+        Folder folder,
+        uint header_count,
+        Cancellable? cancellable
+    ) {
+        if (this.mail_session == null)
+            return false;
+        try {
+            var camel_total = yield this.mail_session.local_uid_count (account, folder, cancellable);
+            if (cancellable != null && cancellable.is_cancelled ())
+                return false;
+            if (!folder_summary_looks_incomplete (camel_total, header_count))
+                return false;
+            folder.total = int.max (folder.total, camel_total);
+            refresh_folder_badge (folder);
+            return true;
+        } catch (Error e) {
+            if (!(e is IOError.CANCELLED))
+                debug ("Camel uid count %s: %s", folder.name, e.message);
+            return false;
+        }
+    }
+
     private async void align_folder_with_server (
         Account account,
         Folder folder,
         Cancellable cancellable,
-        bool high = false
+        bool high = false,
+        uint refresh_timeout_seconds = 0
     ) {
         if (this.mail_session == null)
             return;
@@ -908,10 +998,14 @@ public class Mail.Window : Adw.ApplicationWindow {
         var known = snapshot_uids (cached);
         var current = is_current_folder (folder);
         var t0 = Utils.sync_tick ();
-        Utils.sync_log ("align “%s” begin (watch=%s high=%s had=%u)".printf (
+        var budget = refresh_timeout_seconds == MailSession.REFRESH_INFO_SKIP
+            ? "skip"
+            : (refresh_timeout_seconds == 0 ? "default" : "%us".printf (refresh_timeout_seconds));
+        Utils.sync_log ("align “%s” begin (watch=%s high=%s budget=%s had=%u)".printf (
             folder.name,
             current ? "current" : "bg",
             high ? "yes" : "no",
+            budget,
             cached != null ? cached.length : 0
         ));
         try {
@@ -922,7 +1016,8 @@ public class Mail.Window : Adw.ApplicationWindow {
                 cancellable,
                 current,
                 cached,
-                high
+                high,
+                refresh_timeout_seconds
             );
             if (cancellable.is_cancelled () || !is_current_account (account))
                 return;
@@ -951,7 +1046,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                 messages.length
             ));
         } catch (Error e) {
-            if (e is IOError.CANCELLED)
+            if (Utils.is_cancelled_error (e))
                 return;
             Utils.sync_log ("align “%s” FAILED %s: %s".printf (folder.name, Utils.sync_ms (t0), e.message));
             debug ("Mailbox sync %s: %s", folder.name, e.message);
@@ -978,7 +1073,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         return job.folder;
     }
 
-    private void enqueue_sync_job (int kind, Folder? folder, int rank) {
+    private void enqueue_sync_job (int kind, Folder? folder, int rank, uint refresh_timeout = 0) {
         var name = folder != null ? folder.full_name : "";
         for (uint i = 0; i < this.sync_jobs.length; i++) {
             var job = this.sync_jobs[i];
@@ -989,6 +1084,10 @@ public class Mail.Window : Adw.ApplicationWindow {
                 job.rank = rank;
             if (folder != null)
                 job.folder = folder;
+            job.refresh_timeout_seconds = merge_refresh_timeout (
+                job.refresh_timeout_seconds,
+                refresh_timeout
+            );
             return;
         }
 
@@ -996,7 +1095,19 @@ public class Mail.Window : Adw.ApplicationWindow {
         job.kind = kind;
         job.folder = folder;
         job.rank = rank;
+        job.refresh_timeout_seconds = refresh_timeout;
         this.sync_jobs.add (job);
+    }
+
+    private static uint merge_refresh_timeout (uint a, uint b) {
+        if (a == MailSession.REFRESH_INFO_SKIP)
+            return b;
+        if (b == MailSession.REFRESH_INFO_SKIP)
+            return a;
+        /* 0 = default full path (F5 / explicit sync) — wins over a short scout budget. */
+        if (a == 0 || b == 0)
+            return 0;
+        return uint.max (a, b);
     }
 
     private void demote_selected_sync_jobs (Folder keep) {
@@ -1014,15 +1125,162 @@ public class Mail.Window : Adw.ApplicationWindow {
     private void boost_folder_sync (Folder folder) {
         if (folder.is_virtual_view)
             return;
+        var account = this.selected_account;
+        if (account != null) {
+            clear_bulk_refresh_backoff (account, folder);
+            if (folder_wants_tip_refresh (folder))
+                mark_tip_refresh (account, folder);
+        }
         demote_selected_sync_jobs (folder);
-        enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_SELECTED_HEADERS);
-        if (!folder_skips_body_prefetch (folder))
-            enqueue_sync_job (SYNC_KIND_BODIES, folder, RANK_SELECTED_BODIES);
+        enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_SELECTED_HEADERS, 0);
+        if (!folder_skips_body_prefetch (folder)) {
+            /* Bulk body fill stays behind Inbox; still runs within Preferences window. */
+            var body_rank = folder_is_bulk_storage (folder)
+                ? RANK_CACHE_ALIGN
+                : RANK_SELECTED_BODIES;
+            enqueue_sync_job (SYNC_KIND_BODIES, folder, body_rank);
+        }
         pump_sync.begin ();
     }
 
     private void enqueue_new_mail_sync () {
-        enqueue_incoming_folder_sync (RANK_BACKGROUND);
+        enqueue_incoming_folder_sync (RANK_NEW_MAIL);
+    }
+
+    /* Cancel low-priority Camel work so send / Inbox checks can take the lock.
+     * Keep body-prefetch jobs queued — prefetch_recent already yields when
+     * high_refresh_waiters > 0, and dropping them left Archive/Sent undownloaded. */
+    private void preempt_background_sync (string reason) {
+        uint dropped = 0;
+        for (int i = (int) this.sync_jobs.length - 1; i >= 0; i--) {
+            if (this.sync_jobs[i].rank < RANK_BACKGROUND)
+                continue;
+            if (this.sync_jobs[i].kind == SYNC_KIND_BODIES
+                || this.sync_jobs[i].kind == SYNC_KIND_CACHE_ALIGN)
+                continue;
+            this.sync_jobs.remove_index (i);
+            dropped++;
+        }
+        if (this.idle_cancellable != null && !this.idle_cancellable.is_cancelled ())
+            this.idle_cancellable.cancel ();
+        this.idle_cancellable = new Cancellable ();
+        Utils.sync_log ("preempt sync: %s (dropped %u, queue=%u, pump=%s)".printf (
+            reason,
+            dropped,
+            this.sync_jobs.length,
+            this.sync_pump_running ? "busy" : "idle"
+        ));
+    }
+
+    private void ensure_outbox_store () {
+        var app = get_application () as Application;
+        if (app == null || this.mail_session == null)
+            return;
+        if (app.outbox != null) {
+            sync_outbox_folder ();
+            return;
+        }
+
+        var store = new OutboxStore (this.mail_session);
+        app.outbox = store;
+        store.changed.connect (on_outbox_changed);
+        store.item_sent.connect (on_outbox_item_sent);
+        store.item_needs_attention.connect (on_outbox_needs_attention);
+        store.start ();
+        sync_outbox_folder ();
+    }
+
+    private void on_outbox_changed () {
+        sync_outbox_folder ();
+    }
+
+    private void on_outbox_item_sent (PendingMail item) {
+        show_toast (_("Sent “%s”").printf (item.display_subject));
+        sync_outbox_folder ();
+    }
+
+    private void on_outbox_needs_attention (PendingMail item, string message) {
+        var toast = new Adw.Toast (
+            _("Could not send “%s”: %s").printf (item.display_subject, message)
+        ) {
+            timeout = 0,
+            button_label = _("Outbox"),
+        };
+        toast.button_clicked.connect (() => {
+            select_outbox_folder ();
+        });
+        this.toast_overlay.add_toast (toast);
+        sync_outbox_folder ();
+    }
+
+    private void open_pending_compose (PendingMail item, bool from_outbox) {
+        var app = get_application () as Application;
+        if (app?.outbox == null || this.mail_session == null)
+            return;
+
+        Account? account = null;
+        for (uint i = 0; i < app.accounts.items.get_n_items (); i++) {
+            var a = app.accounts.items.get_item (i) as Account;
+            if (a == null)
+                continue;
+            var uid = a.source_uid ?? a.uid;
+            if (uid == item.account_uid) {
+                account = a;
+                break;
+            }
+        }
+        if (account == null)
+            account = this.selected_account;
+
+        var attachments = app.outbox.load_outbox_attachments (item);
+        var content = new MessageContent () {
+            uid = item.id,
+            subject = item.subject,
+            to = item.to,
+            cc = item.cc,
+            bcc = item.bcc,
+            html = item.html,
+            plain_text = item.plain,
+            message_id = item.reply_message_id,
+            in_reply_to = item.reply_in_reply_to,
+            attachments = attachments,
+        };
+        var compose = new ComposeWindow (
+            app,
+            this.mail_session,
+            app.accounts,
+            account,
+            item.to,
+            item.cc,
+            item.subject,
+            content,
+            item.is_forward,
+            item.bcc,
+            true
+        );
+        compose.adopt_compose_id (item.id);
+        if (from_outbox)
+            app.outbox.delete_outbox_item (item.id);
+        var thread = app.outbox.thread_content_for (item);
+        if (thread != null)
+            compose.set_thread_parent (thread);
+        if (attachments.length > 0)
+            compose.attach_pending_files (attachments);
+        compose.present ();
+        if (from_outbox)
+            compose.seed_autosave.begin ();
+    }
+
+    private void on_send_starting () {
+        preempt_background_sync ("send");
+        this.send_status_token = show_sync_status (_("Sending…"));
+    }
+
+    private void on_send_finished () {
+        hide_sync_status (this.send_status_token);
+        this.send_status_token = 0;
+        enqueue_cache_align ();
+        schedule_folder_scout (20);
     }
 
     /* After the folder tree is ready: sync the Inbox tree first, then scout
@@ -1034,6 +1292,30 @@ public class Mail.Window : Adw.ApplicationWindow {
         enqueue_incoming_folder_sync (RANK_SELECTED_HEADERS);
         watch_new_mail_folders.begin ();
         schedule_folder_scout (3);
+        /* Body window from Preferences — includes Archive/Sent once headers exist. */
+        Timeout.add_seconds (8, () => {
+            if (!this.tearing_down)
+                enqueue_cache_align ();
+            return Source.REMOVE;
+        });
+    }
+
+    /* After headers are current, keep downloading bodies in the configured window. */
+    private void enqueue_body_prefetch_after_headers (Folder folder, bool current) {
+        if (folder_skips_body_prefetch (folder))
+            return;
+        var account = this.selected_account;
+        if (account == null)
+            return;
+        var listed = this.message_cache.get (message_cache_key (account, folder));
+        if (listed == null || listed.length == 0)
+            return;
+        /* Bulk folders stay at cache-align priority so Inbox/send stay responsive. */
+        var rank = current && !folder_is_bulk_storage (folder)
+            ? RANK_SELECTED_BODIES
+            : RANK_CACHE_ALIGN;
+        enqueue_sync_job (SYNC_KIND_BODIES, folder, rank);
+        pump_sync.begin ();
     }
 
     private void schedule_idle_bulk_align (bool from_startup) {
@@ -1075,6 +1357,11 @@ public class Mail.Window : Adw.ApplicationWindow {
             return false;
         if (folder_is_incoming_watch (folder))
             return false;
+        /* While Archive/move flush is pending, skip Trash/Junk scout — those
+         * probes flood the log and contend for Camel with Graph moves. */
+        if (this.mail_session != null && this.mail_session.pending_transfer_jobs > 0
+            && (folder.kind == FolderKind.TRASH || folder.kind == FolderKind.JUNK))
+            return false;
         return true;
     }
 
@@ -1108,8 +1395,6 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
 
         this.folder_scout_running = true;
-        uint cold = 0;
-        uint warm = 0;
         try {
             var folders = mailbox_sync_folders ();
             var list = new GenericArray<Folder> ();
@@ -1124,24 +1409,68 @@ public class Mail.Window : Adw.ApplicationWindow {
                 return a.name.collate (b.name);
             });
 
+            if (list.length == 0) {
+                Utils.sync_log ("folder scout: nothing to align");
+                enqueue_cache_align ();
+                return;
+            }
+
+            if (compose_windows_open ()) {
+                /* Keep filling bodies while the user writes; only skip header probes. */
+                Utils.sync_log ("folder scout: header probe paused (compose open)");
+                enqueue_cache_align ();
+                schedule_folder_scout (30);
+                return;
+            }
+
             Utils.sync_log ("folder scout: checking %u non-inbox folders".printf (list.length));
-            for (uint i = 0; i < list.length; i++) {
+
+            /* Rotate so Sent's tiny ±few drift cannot starve Archive forever. */
+            var start = this.folder_scout_cursor % list.length;
+            this.folder_scout_cursor = start + 1;
+
+            Folder? pick = null;
+            int pick_deficit = 0;
+            string pick_why = "";
+            bool pick_cold = false;
+
+            for (uint n = 0; n < list.length; n++) {
                 if (this.tearing_down || !is_current_account (account))
                     break;
-                if (compose_windows_open ()) {
-                    Utils.sync_log ("folder scout: paused (compose open)");
-                    schedule_folder_scout (30);
+                if (compose_windows_open ())
                     break;
-                }
 
-                var folder = list[i];
+                var folder = list[(start + n) % list.length];
                 uint local_total = 0;
                 uint local_unread = 0;
                 local_header_stats (account, folder, out local_total, out local_unread);
 
                 try {
+                    /* Fast path: Letter header list behind Camel's local summary. */
+                    var camel_n = yield this.mail_session.local_uid_count (
+                        account,
+                        folder,
+                        this.idle_cancellable
+                    );
+                    var camel_gap = scout_total_gap (camel_n, local_total);
+                    if (camel_gap > pick_deficit && folder_idle_align_safe (folder)) {
+                        folder.total = int.max (folder.total, camel_n);
+                        pick = folder;
+                        pick_deficit = camel_gap;
+                        pick_why = "Camel summary ahead (%d vs %u)".printf (camel_n, local_total);
+                        pick_cold = local_total == 0;
+                    }
+                } catch (Error e) {
+                    if (e is IOError.CANCELLED)
+                        break;
+                    Utils.sync_log ("folder scout “%s” camel count skipped: %s".printf (
+                        folder.name,
+                        e.message
+                    ));
+                }
+
+                try {
                     if (local_total == 0) {
-                        /* Cold list: trust tree totals/unread, else probe. */
                         var needs = folder.total > 0 || folder.unread > 0;
                         if (!needs)
                             needs = yield this.mail_session.remote_counts_differ (
@@ -1151,16 +1480,18 @@ public class Mail.Window : Adw.ApplicationWindow {
                                 0,
                                 this.idle_cancellable
                             );
-                        if (needs) {
-                            enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_IDLE_BULK);
-                            cold++;
-                            Utils.sync_log ("folder scout cold: “%s” (remote total %d unread %d)".printf (
-                                folder.name,
+                        var gap = scout_total_gap (folder.total, 0);
+                        if (needs && gap > pick_deficit && folder_idle_align_safe (folder)) {
+                            pick = folder;
+                            pick_deficit = int.max (gap, 1);
+                            pick_why = "cold (remote total %d unread %d)".printf (
                                 folder.total,
                                 folder.unread
-                            ));
+                            );
+                            pick_cold = true;
                         }
                     } else {
+                        var before_total = folder.total;
                         var differs = yield this.mail_session.remote_counts_differ (
                             account,
                             folder,
@@ -1169,14 +1500,24 @@ public class Mail.Window : Adw.ApplicationWindow {
                             this.idle_cancellable
                         );
                         if (differs) {
-                            enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_IDLE_BULK);
-                            refresh_folder_badge (folder);
-                            warm++;
-                            Utils.sync_log ("folder scout warm: “%s” counts drifted (local %u/%u)".printf (
-                                folder.name,
-                                local_unread,
-                                local_total
-                            ));
+                            var gap = scout_total_gap (folder.total, local_total);
+                            var unread_gap = (folder.unread - (int) local_unread).abs ();
+                            /* Any real count mismatch is enough — brief refresh_info
+                             * is cheap. The old gap<50 filter skipped legitimate
+                             * +1 Sent/Archive changes from other clients forever. */
+                            var score = int.max (gap, unread_gap);
+                            if (score == 0)
+                                score = 1;
+                            if (score > pick_deficit && folder_idle_align_safe (folder)) {
+                                pick = folder;
+                                pick_deficit = score;
+                                pick_why = "counts drifted (local %u/%u, was tree %d)".printf (
+                                    local_unread,
+                                    local_total,
+                                    before_total
+                                );
+                                pick_cold = false;
+                            }
                         }
                     }
                 } catch (Error e) {
@@ -1185,20 +1526,84 @@ public class Mail.Window : Adw.ApplicationWindow {
                     Utils.sync_log ("folder scout “%s” skipped: %s".printf (folder.name, e.message));
                 }
 
-                /* Keep Camel free for Inbox / UI between probes. */
-                Timeout.add (80, run_folder_scout.callback);
+                Timeout.add (40, run_folder_scout.callback);
                 yield;
             }
 
-            if (cold > 0 || warm > 0) {
-                Utils.sync_log ("folder scout: queued %u cold + %u warm aligns".printf (cold, warm));
+            /* Sent/Drafts often change at the tip without a total mismatch
+             * (replace UID, +1/−1). Count scout alone never sees that. */
+            Folder? tip = null;
+            for (uint n = 0; n < list.length; n++) {
+                var folder = list[n];
+                if (!folder_wants_tip_refresh (folder))
+                    continue;
+                if (!folder_idle_align_safe (folder))
+                    continue;
+                if (!tip_refresh_due (account, folder))
+                    continue;
+                tip = folder;
+                break;
+            }
+
+            uint queued = 0;
+            if (tip != null) {
+                enqueue_sync_job (
+                    SYNC_KIND_HEADERS,
+                    tip,
+                    RANK_BACKGROUND,
+                    MailSession.REFRESH_INFO_BRIEF
+                );
+                mark_tip_refresh (account, tip);
+                queued++;
+                Utils.sync_log ("folder scout tip: “%s” budget=15s".printf (tip.name));
+            }
+
+            if (pick != null
+                && (tip == null || tip.full_name != pick.full_name)) {
+                uint timeout = 0;
+                if (!scout_schedule_refresh (account, pick, pick_cold, pick_why, out timeout)) {
+                    refresh_folder_badge (pick);
+                    Utils.sync_log ("folder scout defer “%s” (backoff, deficit≈%d)".printf (
+                        pick.name,
+                        pick_deficit
+                    ));
+                } else {
+                    enqueue_sync_job (SYNC_KIND_HEADERS, pick, RANK_IDLE_BULK, timeout);
+                    refresh_folder_badge (pick);
+                    if (folder_wants_tip_refresh (pick))
+                        mark_tip_refresh (account, pick);
+                    queued++;
+                    Utils.sync_log ("folder scout %s: “%s” %s (deficit≈%d budget=%s)".printf (
+                        pick_cold ? "cold" : "warm",
+                        pick.name,
+                        pick_why,
+                        pick_deficit,
+                        timeout == MailSession.REFRESH_INFO_SKIP
+                            ? "camel-only"
+                            : "%us".printf (timeout)
+                    ));
+                }
+            }
+
+            if (queued > 0) {
+                Utils.sync_log ("folder scout: queued %u align".printf (queued));
                 pump_sync.begin ();
+                schedule_folder_scout (15);
             } else {
                 Utils.sync_log ("folder scout: nothing to align");
+                enqueue_cache_align ();
             }
         } finally {
             this.folder_scout_running = false;
         }
+    }
+
+    private static int scout_total_gap (int expected_total, uint local_count) {
+        if (expected_total <= 0)
+            return 0;
+        if (local_count >= (uint) expected_total)
+            return 0;
+        return expected_total - (int) local_count;
     }
 
     private bool compose_windows_open () {
@@ -1269,6 +1674,144 @@ public class Mail.Window : Adw.ApplicationWindow {
         return true;
     }
 
+    /* After a brief attempt that did not close the gap — escalate sooner. */
+    private const int64 BULK_REFRESH_BACKOFF_ESCALATE = 2 * 60 * TimeSpan.SECOND;
+    /* After FULL budget still drifting — stop hammering Graph. */
+    private const int64 BULK_REFRESH_BACKOFF_EXHAUSTED = 45 * 60 * TimeSpan.SECOND;
+
+    private bool scout_schedule_refresh (
+        Account account,
+        Folder folder,
+        bool cold,
+        string why,
+        out uint timeout_seconds
+    ) {
+        timeout_seconds = 0;
+
+        /* Letter headers behind Camel local summary — no Graph needed. */
+        if (why.has_prefix ("Camel summary ahead")) {
+            timeout_seconds = MailSession.REFRESH_INFO_SKIP;
+            return true;
+        }
+
+        /* Small / incoming-adjacent folders: normal default budget. */
+        if (!folder_is_bulk_storage (folder) && !MailSession.folder_is_heavy (folder)
+            && folder.total <= 1500 && !cold) {
+            timeout_seconds = MailSession.REFRESH_INFO_NORMAL;
+            return true;
+        }
+
+        var key = message_cache_key (account, folder);
+        var now = Utils.sync_tick ();
+        var until = this.bulk_refresh_next_allowed.get (key);
+        if (until != null && now < until)
+            return false;
+
+        if (cold) {
+            timeout_seconds = MailSession.REFRESH_INFO_FULL;
+            return true;
+        }
+
+        var level = 0;
+        if (this.bulk_refresh_level.contains (key))
+            level = this.bulk_refresh_level.get (key);
+        switch (level) {
+            case 0:
+                timeout_seconds = MailSession.REFRESH_INFO_BRIEF;
+                break;
+            case 1:
+                timeout_seconds = MailSession.REFRESH_INFO_NORMAL;
+                break;
+            default:
+                timeout_seconds = MailSession.REFRESH_INFO_FULL;
+                break;
+        }
+        return true;
+    }
+
+    private async void note_scout_align_result (Account account, Folder folder, uint used_timeout) {
+        if (used_timeout == MailSession.REFRESH_INFO_SKIP)
+            return;
+        if (!folder_is_bulk_storage (folder) && !MailSession.folder_is_heavy (folder)
+            && folder.total <= 1500)
+            return;
+
+        var key = message_cache_key (account, folder);
+        var now = Utils.sync_tick ();
+        uint local_total = 0;
+        uint local_unread = 0;
+        local_header_stats (account, folder, out local_total, out local_unread);
+
+        var still = false;
+        try {
+            still = yield this.mail_session.remote_counts_differ (
+                account,
+                folder,
+                (int) local_total,
+                (int) local_unread,
+                null
+            );
+        } catch (Error e) {
+            Utils.sync_log ("bulk refresh result check “%s”: %s".printf (folder.name, e.message));
+            still = true;
+        }
+
+        if (!still) {
+            /* Ready for the next sync-cycle scout — no multi-minute lockout. */
+            this.bulk_refresh_level.remove (key);
+            this.bulk_refresh_next_allowed.remove (key);
+            Utils.sync_log ("bulk refresh “%s” settled".printf (folder.name));
+            return;
+        }
+
+        var level = 0;
+        if (this.bulk_refresh_level.contains (key))
+            level = this.bulk_refresh_level.get (key);
+        if (level < 2) {
+            this.bulk_refresh_level.set (key, level + 1);
+            this.bulk_refresh_next_allowed.set (key, now + BULK_REFRESH_BACKOFF_ESCALATE);
+            Utils.sync_log ("bulk refresh “%s” still drifting — escalate to level %d in 2m".printf (
+                folder.name,
+                level + 1
+            ));
+        } else {
+            this.bulk_refresh_next_allowed.set (key, now + BULK_REFRESH_BACKOFF_EXHAUSTED);
+            Utils.sync_log ("bulk refresh “%s” still drifting after full budget — pause 45m".printf (
+                folder.name
+            ));
+        }
+    }
+
+    private void clear_bulk_refresh_backoff (Account account, Folder folder) {
+        var key = message_cache_key (account, folder);
+        this.bulk_refresh_next_allowed.remove (key);
+        this.bulk_refresh_level.remove (key);
+    }
+
+    private void clear_all_bulk_refresh_backoff () {
+        this.bulk_refresh_next_allowed.remove_all ();
+        this.bulk_refresh_level.remove_all ();
+        this.tip_refresh_last.remove_all ();
+    }
+
+    /* Sent/Drafts: tip can move while totals stay equal. */
+    private static bool folder_wants_tip_refresh (Folder folder) {
+        return folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS;
+    }
+
+    private const int64 TIP_REFRESH_INTERVAL = 5 * 60 * TimeSpan.SECOND;
+
+    private bool tip_refresh_due (Account account, Folder folder) {
+        var last = this.tip_refresh_last.get (message_cache_key (account, folder));
+        if (last == null)
+            return true;
+        return (Utils.sync_tick () - last) >= TIP_REFRESH_INTERVAL;
+    }
+
+    private void mark_tip_refresh (Account account, Folder folder) {
+        this.tip_refresh_last.set (message_cache_key (account, folder), Utils.sync_tick ());
+    }
+
     private static int idle_bulk_sort_rank (Folder folder) {
         switch (folder.kind) {
             case FolderKind.SENT:
@@ -1336,15 +1879,48 @@ public class Mail.Window : Adw.ApplicationWindow {
 
     private void enqueue_cache_align () {
         var folders = mailbox_sync_folders ();
+        var list = new GenericArray<Folder> ();
         for (uint i = 0; i < folders.length; i++) {
             var folder = folders[i];
             if (folder.is_virtual_view || folder.is_gmail_namespace)
                 continue;
             if (folder_skips_body_prefetch (folder))
                 continue;
-            enqueue_sync_job (SYNC_KIND_CACHE_ALIGN, folder, RANK_CACHE_ALIGN);
+            list.add (folder);
         }
+        /* Stable order: Inbox tree first, then Sent, Archive, … so status
+         * does not bounce between unrelated folders mid-fill. */
+        list.sort ((a, b) => {
+            int rank = body_fill_sort_rank (a) - body_fill_sort_rank (b);
+            if (rank != 0)
+                return rank;
+            return a.full_name.collate (b.full_name);
+        });
+        for (uint i = 0; i < list.length; i++)
+            enqueue_sync_job (SYNC_KIND_CACHE_ALIGN, list[i], RANK_CACHE_ALIGN + (int) i);
         pump_sync.begin ();
+    }
+
+    private static int body_fill_sort_rank (Folder folder) {
+        if (folder_is_incoming_watch (folder))
+            return 0;
+        switch (folder.kind) {
+            case FolderKind.SENT:
+                return 1;
+            case FolderKind.DRAFTS:
+                return 2;
+            case FolderKind.OUTBOX:
+                return 3;
+            case FolderKind.ARCHIVE:
+            case FolderKind.ALL:
+                return 4;
+            case FolderKind.TRASH:
+                return 5;
+            case FolderKind.JUNK:
+                return 6;
+            default:
+                return 7;
+        }
     }
 
     private void finish_startup_tree (GenericArray<string> added) {
@@ -1394,6 +1970,23 @@ public class Mail.Window : Adw.ApplicationWindow {
             if (this.sync_jobs[i].rank < this.sync_jobs[best].rank)
                 best = i;
         }
+
+        /* Finish one folder's body window before hopping to another. Priority
+         * work (Inbox / send / open) still wins via lower rank. */
+        if (this.sync_jobs[best].rank >= RANK_CACHE && this.body_fill_folder != null) {
+            for (uint i = 0; i < this.sync_jobs.length; i++) {
+                var candidate = this.sync_jobs[i];
+                if (candidate.kind != SYNC_KIND_BODIES && candidate.kind != SYNC_KIND_CACHE_ALIGN)
+                    continue;
+                if (candidate.folder == null || candidate.folder.full_name != this.body_fill_folder)
+                    continue;
+                if (candidate.rank > this.sync_jobs[best].rank)
+                    continue;
+                best = i;
+                break;
+            }
+        }
+
         var job = this.sync_jobs[best];
         this.sync_jobs.remove_index (best);
         return job;
@@ -1406,27 +1999,31 @@ public class Mail.Window : Adw.ApplicationWindow {
             var token = show_sync_status (_("Checking folders…"));
             try {
                 var folders = yield this.mail_session.list_folders (account, null, true);
-                if (cancellable.is_cancelled () || !is_current_account (account))
+                if (!is_current_account (account))
                     return;
-                if (folders.length == 0) {
-                    finish_startup_tree (new GenericArray<string> ());
-                    return;
-                }
                 var added = new GenericArray<string> ();
-                var resolved = reuse_sidebar_folders (folders, added);
-                Utils.sync_log ("folder tree compare: %s (%u added)".printf (
-                    added.length == 0 ? "unchanged" : "diff",
-                    added.length
-                ));
-                apply_folder_tree (resolved);
-                remember_folder_tree (account, resolved);
-                mark_inbox_tree_on_sidebar ();
-                this.last_full_align = Utils.sync_tick ();
+                /* Opening Inbox can preempt/cancel this job mid-flight. Still
+                 * finish startup so Inbox sync is not skipped until F5. */
+                if (folders.length > 0 && !cancellable.is_cancelled ()) {
+                    var resolved = reuse_sidebar_folders (folders, added);
+                    Utils.sync_log ("folder tree compare: %s (%u added)".printf (
+                        added.length == 0 ? "unchanged" : "diff",
+                        added.length
+                    ));
+                    apply_folder_tree (resolved);
+                    remember_folder_tree (account, resolved);
+                    mark_inbox_tree_on_sidebar ();
+                    this.last_full_align = Utils.sync_tick ();
+                } else if (cancellable.is_cancelled ()) {
+                    Utils.sync_log ("folder tree refresh preempted — continuing startup sync");
+                }
                 finish_startup_tree (added);
             } catch (Error e) {
                 if (!(e is IOError.CANCELLED))
                     debug ("Folder tree refresh: %s", e.message);
-                if (!(e is IOError.CANCELLED) && is_current_account (account))
+                else
+                    Utils.sync_log ("folder tree refresh cancelled — continuing startup sync");
+                if (is_current_account (account))
                     finish_startup_tree (new GenericArray<string> ());
             } finally {
                 hide_sync_status (token);
@@ -1439,20 +2036,50 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
 
         if (job.kind == SYNC_KIND_HEADERS) {
-            if (this.mail_session.folder_has_pending_flags (account, folder))
+            if (this.mail_session.folder_has_pending_flags (account, folder)) {
+                /* pump_sync defers these with a delay; keep as safety net. */
+                enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds);
                 return;
-            var current = is_current_folder (folder);
-            uint token = 0;
-            if (current) {
-                this.conversation_sync_spinner.visible = true;
-                token = show_sync_status (_("Updating “%s”…").printf (folder.name));
             }
-            var high = current;
-            yield align_folder_with_server (account, folder, cancellable, high);
+            var current = is_current_folder (folder);
             if (current)
-                this.conversation_sync_spinner.visible = false;
-            if (token != 0)
-                hide_sync_status (token);
+                this.conversation_sync_spinner.visible = true;
+            /* Idle scout aligns stay quiet — only F5 / explicit sync show status
+             * for non-open folders; the open folder may still show Updating. */
+            var show_status = current || job.rank < RANK_IDLE_BULK;
+            uint token = 0;
+            if (show_status)
+                token = show_sync_status (_("Updating “%s”…").printf (folder.name));
+            /* Only the open folder uses HIGH Camel refresh — timer Inbox-tree
+             * children stay LOW so one hung Graph call cannot block reading. */
+            var high = current;
+            var refresh_timeout = job.refresh_timeout_seconds;
+            if (current)
+                refresh_timeout = 0;
+            var aligned = false;
+            try {
+                yield align_folder_with_server (account, folder, cancellable, high, refresh_timeout);
+                aligned = !cancellable.is_cancelled ();
+            } catch (Error e) {
+                if (Utils.is_cancelled_error (e) || cancellable.is_cancelled ()) {
+                    enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds);
+                    Utils.sync_log ("headers “%s” interrupted — requeued".printf (folder.name));
+                } else {
+                    debug ("Headers %s: %s", folder.name, e.message);
+                }
+            } finally {
+                if (current)
+                    this.conversation_sync_spinner.visible = false;
+                if (show_status)
+                    hide_sync_status (token);
+            }
+            if (aligned) {
+                if (job.rank >= RANK_IDLE_BULK && !current)
+                    yield note_scout_align_result (account, folder, refresh_timeout);
+                enqueue_body_prefetch_after_headers (folder, current);
+            } else if (cancellable.is_cancelled ()) {
+                enqueue_sync_job (SYNC_KIND_HEADERS, folder, job.rank, job.refresh_timeout_seconds);
+            }
             return;
         }
 
@@ -1460,17 +2087,38 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
 
         if (job.kind == SYNC_KIND_CACHE_ALIGN) {
-            yield run_cache_align (account, folder, cancellable);
+            remember_body_fill_folder (folder);
+            var token = show_sync_status (_("Updating “%s”…").printf (folder.name));
+            try {
+                yield run_cache_align (account, folder, cancellable);
+                if (cancellable.is_cancelled ()) {
+                    enqueue_sync_job (SYNC_KIND_CACHE_ALIGN, folder, job.rank);
+                    remember_body_fill_folder (folder);
+                    Utils.sync_log ("cache-align “%s” interrupted — requeued".printf (folder.name));
+                }
+            } catch (Error e) {
+                if (Utils.is_cancelled_error (e) || cancellable.is_cancelled ()) {
+                    enqueue_sync_job (SYNC_KIND_CACHE_ALIGN, folder, job.rank);
+                    remember_body_fill_folder (folder);
+                    Utils.sync_log ("cache-align “%s” interrupted — requeued".printf (folder.name));
+                } else {
+                    debug ("Cache align %s: %s", folder.name, e.message);
+                    clear_body_fill_folder (folder);
+                }
+            } finally {
+                hide_sync_status (token);
+            }
             return;
         }
 
-        uint token = 0;
-        if (is_current_folder (folder))
-            token = show_sync_status (_("Downloading messages in “%s”…").printf (folder.name));
+        remember_body_fill_folder (folder);
+        var token = show_sync_status (_("Downloading messages in “%s”…").printf (folder.name));
         try {
             var listed = this.message_cache.get (message_cache_key (account, folder));
-            if (listed == null || listed.length == 0)
+            if (listed == null || listed.length == 0) {
+                clear_body_fill_folder (folder);
                 return;
+            }
             var days = body_cache_days ();
             var fetched = yield this.mail_session.prefetch_recent (
                 account,
@@ -1479,15 +2127,36 @@ public class Mail.Window : Adw.ApplicationWindow {
                 days,
                 cancellable
             );
-            if (fetched >= MailSession.PREFETCH_NETWORK_CHUNK)
+            if (fetched >= MailSession.PREFETCH_NETWORK_CHUNK) {
+                /* Stay on this folder until its download window is complete. */
                 enqueue_sync_job (SYNC_KIND_BODIES, folder, job.rank);
+            } else {
+                clear_body_fill_folder (folder);
+            }
         } catch (Error e) {
-            if (!(e is IOError.CANCELLED))
+            if (e is IOError.CANCELLED) {
+                /* Send / Inbox / open-body preempt — put the chunk back so
+                 * Archive fill continues after priority work. */
+                enqueue_sync_job (SYNC_KIND_BODIES, folder, job.rank);
+                remember_body_fill_folder (folder);
+                Utils.sync_log ("prefetch “%s” interrupted — requeued".printf (folder.name));
+            } else {
                 debug ("Prefetch %s: %s", folder.name, e.message);
+                clear_body_fill_folder (folder);
+            }
         } finally {
-            if (token != 0)
-                hide_sync_status (token);
+            hide_sync_status (token);
         }
+    }
+
+    private void remember_body_fill_folder (Folder folder) {
+        if (this.body_fill_folder == null || this.body_fill_folder == folder.full_name)
+            this.body_fill_folder = folder.full_name;
+    }
+
+    private void clear_body_fill_folder (Folder folder) {
+        if (this.body_fill_folder == folder.full_name)
+            this.body_fill_folder = null;
     }
 
     private int body_cache_days () {
@@ -1514,8 +2183,9 @@ public class Mail.Window : Adw.ApplicationWindow {
 
             enqueue_sync_job (SYNC_KIND_BODIES, folder, RANK_CACHE_ALIGN);
         } catch (Error e) {
-            if (!(e is IOError.CANCELLED))
-                debug ("Cache align %s: %s", folder.name, e.message);
+            if (Utils.is_cancelled_error (e) || cancellable.is_cancelled ())
+                throw e;
+            debug ("Cache align %s: %s", folder.name, e.message);
         }
     }
 
@@ -1536,6 +2206,33 @@ public class Mail.Window : Adw.ApplicationWindow {
                 if (job == null)
                     break;
 
+                /* Don't start another Archive body chunk while send/open waits
+                 * or while archive/move flush still owns Camel. Parked heavy
+                 * moves alone must not starve body fill. */
+                if (this.mail_session != null
+                    && (this.mail_session.priority_camel_waiting
+                        || this.mail_session.has_blocking_local_flushes ())
+                    && job.rank >= RANK_CACHE
+                    && (job.kind == SYNC_KIND_BODIES || job.kind == SYNC_KIND_CACHE_ALIGN)) {
+                    enqueue_sync_job (job.kind, job.folder, job.rank);
+                    Timeout.add (250, pump_sync.callback);
+                    yield;
+                    continue;
+                }
+
+                /* Header refresh while moves/flags are still pending for this
+                 * folder used to requeue with Idle (no delay) → hundreds of
+                 * thousands of “Updating…” spins and a wedged UI. */
+                if (this.mail_session != null
+                    && job.kind == SYNC_KIND_HEADERS
+                    && job.folder != null
+                    && this.mail_session.folder_has_pending_flags (account, job.folder)) {
+                    enqueue_sync_job (job.kind, job.folder, job.rank, job.refresh_timeout_seconds);
+                    Timeout.add (500, pump_sync.callback);
+                    yield;
+                    continue;
+                }
+
                 Utils.sync_log ("sync job kind=%d rank=%d folder=%s queue=%u".printf (
                     job.kind,
                     job.rank,
@@ -1548,6 +2245,13 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
         } finally {
             this.sync_pump_running = false;
+            /* After preempt/cancel, finish draining any higher-priority jobs. */
+            if (!this.tearing_down && this.sync_jobs.length > 0) {
+                Idle.add (() => {
+                    pump_sync.begin ();
+                    return Source.REMOVE;
+                });
+            }
         }
     }
 
@@ -2008,9 +2712,13 @@ public class Mail.Window : Adw.ApplicationWindow {
     private bool viewing_bookmarks () {
         if (this.selected_folder == null)
             return false;
-        if (this.selected_folder.is_virtual_view)
+        if (this.selected_folder.is_bookmarks_view)
             return true;
         return is_gmail_account () && this.selected_folder.kind == FolderKind.STARRED;
+    }
+
+    private bool viewing_outbox () {
+        return this.selected_folder != null && this.selected_folder.is_local_outbox;
     }
 
     private bool is_gmail_account () {
@@ -2023,7 +2731,11 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (account == null || folder == null)
             return;
 
-        if (folder.is_virtual_view) {
+        if (folder.is_local_outbox) {
+            show_outbox_messages ();
+            return;
+        }
+        if (folder.is_bookmarks_view) {
             show_bookmarked_messages ();
             return;
         }
@@ -2154,8 +2866,12 @@ public class Mail.Window : Adw.ApplicationWindow {
             && accounts_are_same (this.selected_account, account))
             return;
 
-        if (this.selected_account != null && !accounts_are_same (this.selected_account, account))
+        /* Close the previous account's undo window only. Deferred moves/flags
+         * stay in the registry until the sync timer or F5. */
+        if (this.selected_account != null && !accounts_are_same (this.selected_account, account)) {
+            commit_pending_transfer_undo ();
             remember_folder_tree (this.selected_account, folders_from_tree (false));
+        }
 
         this.selecting_account = true;
         this.selected_account = account;
@@ -2171,6 +2887,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.idle_cancellable = new Cancellable ();
         this.sync_jobs = new GenericArray<MailSyncJob> ();
         this.idle_bulk_cursor = 0;
+        this.folder_scout_cursor = 0;
+        this.body_fill_folder = null;
+        clear_all_bulk_refresh_backoff ();
         stop_idle_bulk_align ();
         stop_folder_scout ();
         this.mail_session?.unwatch_all_folders ();
@@ -2867,7 +3586,11 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
 
         var cache_key = message_cache_key (account, folder);
-        if (folder.is_virtual_view) {
+        if (folder.is_local_outbox) {
+            show_outbox_messages ();
+            return;
+        }
+        if (folder.is_bookmarks_view) {
             show_bookmarked_messages ();
             return;
         }
@@ -2886,7 +3609,22 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         }
         var cached = this.message_cache.get (cache_key);
-        if (cached != null) {
+        var tree_total = folder.total;
+        var tree_unread = folder.unread;
+        /* Show what we already have before any Camel work. */
+        if (cached != null && cached.length > 0) {
+            touch_message_cache_key (cache_key);
+            display_messages (account, folder, cached);
+            if (folder_summary_looks_incomplete (tree_total, cached.length)) {
+                folder.total = int.max (folder.total, tree_total);
+                folder.unread = int.max (folder.unread, tree_unread);
+                refresh_folder_badge (folder);
+                show_folder_cache_align_loading (folder);
+                this.conversation_title.subtitle = folder_counts_label (folder);
+            }
+        } else if (folder_waiting_for_cache (folder)) {
+            show_folder_cache_align_loading (folder);
+        } else if (cached != null) {
             touch_message_cache_key (cache_key);
             display_messages (account, folder, cached);
         } else {
@@ -2905,11 +3643,28 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (!is_current_folder (folder))
             return;
 
-        /* Cache-first: fill from disk/Camel local first. Keep tree badge hints
-         * across an empty local summary, then boost if the server still reports mail. */
-        var hint_total = folder.total;
-        var hint_unread = folder.unread;
-        if (this.message_cache.get (cache_key) == null) {
+        /* Cache-first: fill from disk/Camel local first. Rebuild Letter's header
+         * list when it lags Camel's summary. No server refresh on open. */
+        var hint_total = int.max (folder.total, tree_total);
+        var hint_unread = int.max (folder.unread, tree_unread);
+        cached = this.message_cache.get (cache_key);
+        var need_hydrate = cached == null
+            || (cached.length > 0
+                && yield headers_lag_camel_summary (
+                    account,
+                    folder,
+                    cached.length,
+                    this.idle_cancellable ?? new Cancellable ()
+                ));
+        if (need_hydrate) {
+            /* Free Camel only when we need a local summary walk. */
+            preempt_background_sync ("open folder hydrate");
+            if (cached != null && cached.length > 0) {
+                show_folder_cache_align_loading (folder);
+                folder.total = int.max (folder.total, hint_total);
+                folder.unread = int.max (folder.unread, hint_unread);
+                refresh_folder_badge (folder);
+            }
             yield hydrate_folder_headers (
                 account,
                 folder,
@@ -2924,9 +3679,13 @@ public class Mail.Window : Adw.ApplicationWindow {
                 folder.total = int.max (folder.total, hint_total);
                 folder.unread = int.max (folder.unread, hint_unread);
                 refresh_folder_badge (folder);
+                show_folder_cache_align_loading (folder);
             }
         }
         cached = this.message_cache.get (cache_key);
+        /* Server align only for a real local gap, and only when online.
+         * Routine opens stay on cache; F5 / sync timer / scout pull the network. */
+        var needs_server = false;
         if ((cached == null || cached.length == 0)
             && (folder.total > 0 || folder.unread > 0 || hint_total > 0 || hint_unread > 0)
             && !folder_is_incoming_watch (folder)
@@ -2935,8 +3694,29 @@ public class Mail.Window : Adw.ApplicationWindow {
                 folder.total = hint_total;
             if (folder.unread <= 0 && hint_unread > 0)
                 folder.unread = hint_unread;
-            boost_folder_sync (folder);
+            show_folder_cache_align_loading (folder);
+            needs_server = true;
+        } else if (cached != null
+            && folder_summary_looks_incomplete (int.max (hint_total, folder.total), cached.length)) {
+            folder.total = int.max (folder.total, hint_total);
+            folder.unread = int.max (folder.unread, hint_unread);
+            refresh_folder_badge (folder);
+            show_folder_cache_align_loading (folder);
+            needs_server = true;
         }
+        if (needs_server && network_is_available ())
+            boost_folder_sync (folder);
+    }
+
+    private static bool network_is_available () {
+        return NetworkMonitor.get_default ().network_available;
+    }
+
+    private bool folder_summary_looks_incomplete (int expected_total, uint local_count) {
+        if (expected_total <= 0 || local_count >= (uint) expected_total)
+            return false;
+        var missing = expected_total - (int) local_count;
+        return missing >= 500 || (expected_total > (int) local_count * 2 && missing > 100);
     }
 
     private void show_bookmarked_messages () {
@@ -3038,7 +3818,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (is_gmail_account ()) {
             var existing = bookmarks_row ();
             if (existing != null) {
-                var viewing = this.selected_folder != null && this.selected_folder.is_virtual_view;
+                var viewing = this.selected_folder != null && this.selected_folder.is_bookmarks_view;
                 this.folder_list.remove (existing);
                 if (viewing)
                     select_inbox_folder ();
@@ -3060,7 +3840,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         var row = bookmarks_row ();
         if (messages.length == 0) {
             if (row != null) {
-                var viewing = this.selected_folder != null && this.selected_folder.is_virtual_view;
+                var viewing = this.selected_folder != null && this.selected_folder.is_bookmarks_view;
                 this.folder_list.remove (row);
                 if (viewing)
                     select_inbox_folder ();
@@ -3076,7 +3856,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
         row.update_unread ();
 
-        if (this.selected_folder != null && this.selected_folder.is_virtual_view
+        if (this.selected_folder != null && this.selected_folder.is_bookmarks_view
             && this.search_text.length == 0)
             show_bookmarked_messages ();
     }
@@ -3084,7 +3864,7 @@ public class Mail.Window : Adw.ApplicationWindow {
     private FolderRow? bookmarks_row () {
         for (int i = 0; this.folder_list.get_row_at_index (i) != null; i++) {
             var row = this.folder_list.get_row_at_index (i) as FolderRow;
-            if (row != null && row.folder.is_virtual_view)
+            if (row != null && row.folder.is_bookmarks_view)
                 return row;
         }
         return null;
@@ -3112,6 +3892,138 @@ public class Mail.Window : Adw.ApplicationWindow {
                 break;
         }
         return last >= 0 ? last + 1 : 0;
+    }
+
+    private Folder ensure_outbox_folder () {
+        if (this.outbox_folder == null) {
+            this.outbox_folder = new Folder () {
+                name = _("Outbox"),
+                full_name = Folder.OUTBOX_PATH,
+            };
+        }
+        return this.outbox_folder;
+    }
+
+    private void sync_outbox_folder () {
+        var app = get_application () as Application;
+        var pending = app?.outbox != null ? app.outbox.pending_count : 0;
+        var folder = ensure_outbox_folder ();
+        folder.total = (int) pending;
+        folder.unread = 0;
+
+        var row = outbox_row ();
+        if (pending == 0) {
+            if (row != null) {
+                var viewing = viewing_outbox ();
+                this.folder_list.remove (row);
+                if (viewing)
+                    select_inbox_folder ();
+            }
+            return;
+        }
+
+        if (row == null) {
+            var inserted = new FolderRow (folder);
+            connect_folder_row (inserted);
+            this.folder_list.insert (inserted, outbox_insert_index ());
+            row = inserted;
+        }
+        row.update_unread ();
+
+        if (viewing_outbox () && this.search_text.length == 0)
+            show_outbox_messages ();
+    }
+
+    private FolderRow? outbox_row () {
+        for (int i = 0; this.folder_list.get_row_at_index (i) != null; i++) {
+            var row = this.folder_list.get_row_at_index (i) as FolderRow;
+            if (row != null && row.folder.is_local_outbox)
+                return row;
+        }
+        return null;
+    }
+
+    private int outbox_insert_index () {
+        var bookmarks = bookmarks_row ();
+        if (bookmarks != null)
+            return bookmarks.get_index () + 1;
+        return bookmarks_insert_index ();
+    }
+
+    private void select_outbox_folder () {
+        sync_outbox_folder ();
+        var row = outbox_row ();
+        if (row == null)
+            return;
+        this.folder_list.select_row (row);
+        on_folder_activated (row);
+    }
+
+    private void show_outbox_messages () {
+        var app = get_application () as Application;
+        var folder = ensure_outbox_folder ();
+        if (app?.outbox == null)
+            return;
+
+        var items = app.outbox.list_outbox ();
+        var messages = new GenericArray<Message> ();
+        for (uint i = 0; i < items.length; i++) {
+            var item = items[i];
+            var preview = item.plain ?? "";
+            preview = preview.strip ();
+            if (preview.length > 120)
+                preview = preview.substring (0, 120);
+            var status = item.last_error != null && item.attempts > 0
+                ? item.last_error
+                : (app.outbox.active_send_id == item.id
+                    ? _("Sending…")
+                    : _("Waiting to send"));
+            messages.add (new Message () {
+                uid = "local-outbox-" + item.id,
+                subject = item.display_subject,
+                from = status,
+                to = item.to,
+                list_address = item.to,
+                date = item.updated_us / 1000000,
+                seen = true,
+                outgoing = true,
+                local_only = true,
+                has_attachment = item.attachment_names.length > 0,
+                preview = preview,
+                folder_name = folder.name,
+                folder_full_name = folder.full_name,
+            });
+        }
+
+        folder.total = (int) messages.length;
+        folder.unread = 0;
+        refresh_folder_badge (folder);
+
+        if (messages.length == 0) {
+            this.message_store.remove_all ();
+            show_conversation_placeholder (
+                _("Outbox Empty"),
+                _("Messages you send are kept here until delivery succeeds.")
+            );
+            update_folder_heading (folder, 0);
+            return;
+        }
+
+        var conversations = Conversation.as_singles (messages);
+        var listed = listed_conversations (conversations);
+        update_folder_heading (folder, listed.length);
+        show_conversation_list (listed);
+    }
+
+    private string? outbox_id_from_message (Message? message) {
+        if (message?.uid == null || !message.uid.has_prefix ("local-outbox-"))
+            return null;
+        return message.uid.substring ("local-outbox-".length);
+    }
+
+    private bool is_outbox_message (Message? message) {
+        return outbox_id_from_message (message) != null
+            || (message != null && message.folder_full_name == Folder.OUTBOX_PATH);
     }
 
     private void select_inbox_folder () {
@@ -3645,6 +4557,9 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         if (this.mailbox_bootstrapping)
             return;
+        /* Pending archive/delete still on Graph — Camel still lists those UIDs. */
+        if (this.mail_session != null && this.mail_session.has_pending_local_flushes ())
+            return;
         if (folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS
             || folder.kind == FolderKind.OUTBOX || folder.kind == FolderKind.JUNK
             || folder.kind == FolderKind.TRASH || folder.kind == FolderKind.STARRED
@@ -3721,6 +4636,14 @@ public class Mail.Window : Adw.ApplicationWindow {
                 continue;
             visible.add (messages[i]);
         }
+
+        /* While archive/delete is still flushing, never forget hides — a partial
+         * Camel list during folder switch would otherwise drop them and the
+         * next full list resurrects the mail as “new”. */
+        var keep_hides = this.mail_session != null
+            && this.mail_session.folder_has_pending_flags (account, folder);
+        if (keep_hides)
+            return visible;
 
         var drop = new GenericArray<string> ();
         var prefix = "%s\n%s\n".printf (account.source_uid ?? account.uid, folder.full_name);
@@ -4269,6 +5192,34 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (this.mail_session == null || account == null || folder == null)
             return;
 
+        var outbox_id = outbox_id_from_message (message);
+        if (outbox_id != null) {
+            var app = get_application () as Application;
+            var item = app?.outbox?.load_outbox_item (outbox_id);
+            if (item == null)
+                return;
+            var attachments = app.outbox.load_outbox_attachments (item);
+            var content = new MessageContent () {
+                uid = message.uid,
+                subject = item.display_subject,
+                from = item.last_error ?? _("Outbox"),
+                to = item.to,
+                cc = item.cc.length > 0 ? item.cc : null,
+                bcc = item.bcc.length > 0 ? item.bcc : null,
+                html = item.html.length > 0 ? item.html : item.plain,
+                plain_text = item.plain,
+                date = item.updated_us / 1000000,
+                attachments = attachments,
+                message_id = item.reply_message_id,
+                in_reply_to = item.reply_in_reply_to,
+            };
+            this.open_content = content;
+            this.message_reader.show_content (content, true);
+            this.reader_bin.child = this.reader_pane;
+            update_message_actions ();
+            return;
+        }
+
         bind_reader_mailbox ();
         var cached = this.mail_session.peek_body (account, folder, message.uid);
         if (cached != null) {
@@ -4284,6 +5235,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.message_reader.show_loading (message);
         this.reader_bin.child = this.reader_pane;
         set_message_actions_enabled (false);
+        /* Don't let a hung background refresh_info hold Camel while reading. */
+        preempt_background_sync ("open body");
+        var status_token = show_sync_status (_("Loading message…"));
 
         try {
             var content = yield this.mail_session.load_message (account, folder, message.uid, cancellable);
@@ -4298,12 +5252,18 @@ public class Mail.Window : Adw.ApplicationWindow {
         } catch (Error e) {
             if (cancellable.is_cancelled () || this.open_message_uid != message.uid)
                 return;
+            if (Utils.is_cancelled_error (e))
+                return;
 
             this.open_content = null;
             this.message_reader.show_error (e.message);
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                 timeout = 5,
             });
+        } finally {
+            hide_sync_status (status_token);
+            /* Resume background body fill after the on-demand open used Camel. */
+            pump_sync.begin ();
         }
     }
 
@@ -4387,6 +5347,17 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.no_folders_page.title = title;
         this.no_folders_page.description = Markup.escape_text (description);
         this.folder_bin.child = this.no_folders_page;
+    }
+
+    private bool folder_waiting_for_cache (Folder folder) {
+        return folder.total > 0 || folder.unread > 0 || this.mailbox_bootstrapping;
+    }
+
+    private void show_folder_cache_align_loading (Folder folder) {
+        show_conversation_loading (
+            _("Aligning local cache"),
+            _("Loading “%s” to match the server. This can take a while on large mailboxes — please wait until the sync finishes.").printf (folder.name)
+        );
     }
 
     private void show_conversation_loading (string title, string description) {
@@ -4762,6 +5733,14 @@ public class Mail.Window : Adw.ApplicationWindow {
     }
 
     private void on_send_again () {
+        if (is_outbox_message (this.open_message)) {
+            var id = outbox_id_from_message (this.open_message);
+            var app = get_application () as Application;
+            var item = id != null ? app?.outbox?.load_outbox_item (id) : null;
+            if (item != null)
+                open_pending_compose (item, true);
+            return;
+        }
         if (is_draft_message (this.open_message)) {
             edit_draft.begin (this.open_message);
             return;
@@ -5343,7 +6322,19 @@ public class Mail.Window : Adw.ApplicationWindow {
         var account = this.selected_account;
         var message = this.open_message;
         var folder = folder_for_message (message);
-        if (this.mail_session == null || account == null || folder == null || message == null)
+        if (message == null)
+            return;
+
+        var outbox_id = outbox_id_from_message (message);
+        if (outbox_id != null) {
+            var app = get_application () as Application;
+            app?.outbox?.delete_outbox_item (outbox_id);
+            show_toast (_("Removed from Outbox"));
+            sync_outbox_folder ();
+            return;
+        }
+
+        if (this.mail_session == null || account == null || folder == null)
             return;
 
         var trash = find_folder_kind (FolderKind.TRASH);
@@ -5351,6 +6342,10 @@ public class Mail.Window : Adw.ApplicationWindow {
             transfer_open_message (trash);
             return;
         }
+
+        /* Already in Trash/Junk (or no Trash) — permanent delete. */
+        if (!yield confirm_permanent_delete (1))
+            return;
 
         var uid = message.uid;
         var unseen = !message.seen;
@@ -5429,6 +6424,9 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         }
 
+        if (!yield confirm_permanent_delete (messages.length))
+            return;
+
         cancel_mark_seen ();
         var groups = group_messages_by_folder (messages);
         var conversations = selected_conversations ();
@@ -5482,6 +6480,26 @@ public class Mail.Window : Adw.ApplicationWindow {
                 }
             );
         }
+    }
+
+    private async bool confirm_permanent_delete (uint count) {
+        string title;
+        string body;
+        if (count <= 1) {
+            title = _("Delete permanently?");
+            body = _("This message will be permanently deleted. This cannot be undone.");
+        } else {
+            title = _("Delete %u messages permanently?").printf (count);
+            body = _("These messages will be permanently deleted. This cannot be undone.");
+        }
+        var dialog = new Adw.AlertDialog (title, body);
+        dialog.add_response ("cancel", _("Cancel"));
+        dialog.add_response ("delete", _("Delete"));
+        dialog.set_response_appearance ("delete", Adw.ResponseAppearance.DESTRUCTIVE);
+        dialog.default_response = "cancel";
+        dialog.close_response = "cancel";
+        var response = yield dialog.choose (this, null);
+        return response == "delete";
     }
 
     private async void set_selected_seen (bool seen) {
@@ -5633,8 +6651,18 @@ public class Mail.Window : Adw.ApplicationWindow {
             refresh_folder_badge (groups[i].folder);
         refresh_folder_badge (destination);
 
-        /* Keep the Camel move off the flush queue until the toast expires
-         * (or Undo is pressed), so cancel stays a pure local reverse. */
+        /* Enqueue Camel moves into the deferred registry. Undo toast is local
+         * only — server push waits for the sync timer or F5. */
+        for (uint i = 0; i < groups.length; i++) {
+            this.mail_session.enqueue_move_messages (
+                account,
+                groups[i].folder,
+                destination,
+                groups[i].uids,
+                groups[i].messages
+            );
+        }
+
         var pending = new PendingTransferUndo () {
             account = account,
             destination = destination,
@@ -5658,8 +6686,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         toast.dismissed.connect (() => {
             if (this.pending_transfer_undo != pending || pending.resolved)
                 return;
+            /* Undo window closed — keep the queued move; do not push to the
+             * server here (sync timer / F5 only). */
             pending.resolved = true;
-            commit_pending_transfer (pending);
             this.pending_transfer_undo = null;
         });
         this.toast_overlay.add_toast (toast);
@@ -5679,29 +6708,52 @@ public class Mail.Window : Adw.ApplicationWindow {
         var pending = this.pending_transfer_undo;
         if (pending == null || pending.resolved)
             return;
+        /* Moves stay in the deferred registry — closing the undo window only
+         * prevents reversing them locally until the next sync / F5. */
         pending.resolved = true;
-        commit_pending_transfer (pending);
         this.pending_transfer_undo = null;
         pending.toast?.dismiss ();
     }
 
-    private void commit_pending_transfer (PendingTransferUndo pending) {
-        if (this.mail_session == null)
+    private void watch_local_flush_status () {
+        /* Local archive/delete/flag already updated the UI. Graph flush can sit
+         * for minutes on large queues — do not show “Synchronizing…” (misleading).
+         * Still watch so body-cache fill resumes when the queue drains. */
+        if (this.flush_status_source != 0)
             return;
-        for (uint i = 0; i < pending.groups.length; i++) {
-            this.mail_session.enqueue_move_messages (
-                pending.account,
-                pending.groups[i].folder,
-                pending.destination,
-                pending.groups[i].uids,
-                pending.groups[i].messages
-            );
+        if (this.mail_session == null || !this.mail_session.has_active_local_flushes ()) {
+            enqueue_cache_align ();
+            pump_sync.begin ();
+            return;
         }
+        this.flush_status_source = Timeout.add_seconds (1, () => {
+            if (this.tearing_down || this.mail_session == null) {
+                this.flush_status_source = 0;
+                return Source.REMOVE;
+            }
+            if (!this.mail_session.has_active_local_flushes ()) {
+                this.flush_status_source = 0;
+                enqueue_cache_align ();
+                pump_sync.begin ();
+                return Source.REMOVE;
+            }
+            return Source.CONTINUE;
+        });
     }
 
     private void undo_pending_transfer (PendingTransferUndo pending) {
         if (this.mail_session == null)
             return;
+
+        for (uint i = 0; i < pending.groups.length; i++) {
+            this.mail_session.cancel_queued_moves (
+                pending.account,
+                pending.groups[i].folder,
+                pending.destination,
+                pending.groups[i].uids,
+                true
+            );
+        }
 
         for (uint i = 0; i < pending.items.length; i++)
             reverse_local_move (pending.account, pending.items[i], pending.destination);
@@ -5932,6 +6984,12 @@ public class Mail.Window : Adw.ApplicationWindow {
     }
 
     private void on_transfer_failed (Account account, Folder from, GenericArray<string> uids, string error) {
+        var down = error.down ();
+        if (down.contains ("cancel") || down.contains ("annullat") || down.contains ("abgebrochen")
+            || MailSession.error_text_means_missing (error)) {
+            Utils.sync_log ("ignore soft transfer failure (%u uids): %s".printf (uids.length, error));
+            return;
+        }
         for (uint i = 0; i < uids.length; i++)
             this.hidden_uids.remove (hide_key (account, from, uids[i]));
         this.toast_overlay.add_toast (new Adw.Toast (error) {
@@ -6283,13 +7341,14 @@ public class Mail.Window : Adw.ApplicationWindow {
         var has = has_message && this.open_content != null;
         var outgoing = has_message && message.outgoing;
         var draft = is_draft_message (message);
+        var outbox = is_outbox_message (message);
         var archived = folder != null && folder.is_archive_mailbox;
         var junk = folder != null && folder.kind == FolderKind.JUNK;
-        var any_archive = has_message && !outgoing && !archived;
+        var any_archive = has_message && !outgoing && !archived && !outbox;
         if (bulk_messages != null) {
             any_archive = false;
             for (uint i = 0; i < bulk_messages.length; i++) {
-                if (bulk_messages[i].outgoing)
+                if (bulk_messages[i].outgoing || is_outbox_message (bulk_messages[i]))
                     continue;
                 var source = folder_for_message (bulk_messages[i]);
                 if (source == null || !source.is_archive_mailbox)
@@ -6297,32 +7356,32 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
         }
 
-        set_win_action_enabled ("reply", has_message && !outgoing && !draft);
-        set_win_action_enabled ("reply-all", has_message && !draft);
-        set_win_action_enabled ("forward", has_message && !draft);
+        set_win_action_enabled ("reply", has_message && !outgoing && !draft && !outbox);
+        set_win_action_enabled ("reply-all", has_message && !draft && !outbox);
+        set_win_action_enabled ("forward", has_message && !draft && !outbox);
         set_win_action_enabled (
             "send-again",
-            has_message && ((outgoing && !message.is_placeholder) || draft)
+            has_message && ((outgoing && !message.is_placeholder) || draft || outbox)
         );
-        set_win_action_enabled ("move", has_message || thread_n > 1);
+        set_win_action_enabled ("move", !outbox && (has_message || thread_n > 1));
         set_win_action_enabled ("archive", any_archive);
         set_win_action_enabled ("delete", has_message || thread_n > 1);
-        set_win_action_enabled ("mark-unread", has_message && !outgoing && message.seen);
-        set_win_action_enabled ("mark-read", has_message && !outgoing && !message.seen);
-        set_win_action_enabled ("bookmark", has_message && !message.is_placeholder);
-        var can_important = is_gmail_account () && has_message && !outgoing && !message.is_placeholder
+        set_win_action_enabled ("mark-unread", has_message && !outgoing && !outbox && message.seen);
+        set_win_action_enabled ("mark-read", has_message && !outgoing && !outbox && !message.seen);
+        set_win_action_enabled ("bookmark", has_message && !message.is_placeholder && !outbox);
+        var can_important = is_gmail_account () && has_message && !outgoing && !outbox && !message.is_placeholder
             && find_folder_kind (FolderKind.IMPORTANT) != null;
         set_win_action_enabled ("mark-important", can_important);
-        set_win_action_enabled ("mark-spam", has_message && !outgoing && !junk && find_folder_kind (FolderKind.JUNK) != null);
-        set_win_action_enabled ("print", has);
+        set_win_action_enabled ("mark-spam", has_message && !outgoing && !outbox && !junk && find_folder_kind (FolderKind.JUNK) != null);
+        set_win_action_enabled ("print", has && !outbox);
         sync_action_bars (
             has_message && message.seen,
-            has_message && !outgoing,
+            has_message && !outgoing && !outbox,
             has_message && message.flagged,
             can_important,
             has_message && message.important,
-            outgoing,
-            draft
+            outgoing || outbox,
+            draft || outbox
         );
         this.message_reader?.set_priority_badge (has_message && message.important);
     }
@@ -6363,7 +7422,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                 this.sync_pump_running ? "busy" : "idle",
                 this.sync_jobs.length
             ));
-            schedule_mail_check (false);
+            schedule_mail_check.begin (false);
             return Source.CONTINUE;
         });
     }
@@ -6548,8 +7607,12 @@ public class Mail.Window : Adw.ApplicationWindow {
 
     private void popup_folder_menu (FolderRow row, double x, double y) {
         var folder = row.folder;
-        if (folder.is_virtual_view) {
+        if (folder.is_bookmarks_view) {
             popup_bookmarks_folder_menu (row, x, y);
+            return;
+        }
+        if (folder.is_local_outbox) {
+            popup_outbox_folder_menu (row, x, y);
             return;
         }
         var trash = find_folder_kind (FolderKind.TRASH);
@@ -6649,6 +7712,23 @@ public class Mail.Window : Adw.ApplicationWindow {
         popup_context_menu (row, menu, group, x, y);
     }
 
+    private void popup_outbox_folder_menu (FolderRow row, double x, double y) {
+        var group = new SimpleActionGroup ();
+        var send_all = new SimpleAction ("send-all-outbox", null);
+        send_all.activate.connect (() => {
+            var app = get_application () as Application;
+            app?.outbox?.request_send_now ();
+            show_toast (_("Retrying Outbox…"));
+        });
+        group.add_action (send_all);
+
+        var menu = new Menu ();
+        var section = new Menu ();
+        section.append (_("Send All Now"), "ctx.send-all-outbox");
+        menu.append_section (null, section);
+        popup_context_menu (row, menu, group, x, y);
+    }
+
     private async void confirm_remove_all_bookmarks () {
         var messages = collect_flagged_messages ();
         if (messages.length == 0)
@@ -6693,8 +7773,10 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (cache != null) {
             for (uint i = 0; i < cache.length; i++)
                 this.hidden_uids.set (hide_key (account, folder, cache[i].uid), 1);
-            this.message_cache.set (key, new GenericArray<Message> ());
         }
+        var empty = new GenericArray<Message> ();
+        this.message_cache.set (key, empty);
+        queue_header_list_cache_save (account, folder, empty);
         folder.unread = 0;
         folder.total = 0;
         refresh_folder_badge (folder);
@@ -6717,6 +7799,13 @@ public class Mail.Window : Adw.ApplicationWindow {
             yield this.mail_session.empty_folder (account, folder);
             refresh_folder_badge (folder);
         } catch (Error e) {
+            /* Graph often reports ErrorItemNotFound for items already purged in
+             * a partial batch — the folder is empty; do not toast that noise. */
+            if (MailSession.error_text_means_missing (e.message)) {
+                Utils.sync_log ("empty “%s” finished with already-gone items".printf (folder.name));
+                refresh_folder_badge (folder);
+                return;
+            }
             this.toast_overlay.add_toast (new Adw.Toast (e.message) {
                 timeout = 5,
             });
@@ -6747,66 +7836,83 @@ public class Mail.Window : Adw.ApplicationWindow {
         var folder = folder_for_message (message);
         var outgoing = message.outgoing;
         var draft = is_draft_message (message);
+        var outbox = is_outbox_message (message);
         var archived = folder != null && folder.is_archive_mailbox;
         var junk = folder != null && folder.kind == FolderKind.JUNK;
         var has_junk = find_folder_kind (FolderKind.JUNK) != null;
         var group = new SimpleActionGroup ();
 
-        add_ctx_action (group, "reply", !outgoing && !draft, () => on_reply ());
-        add_ctx_action (group, "reply-all", !draft, () => on_reply_all ());
-        add_ctx_action (group, "forward", !draft, () => on_forward ());
-        add_ctx_action (group, "send-again", (outgoing && !message.is_placeholder) || draft, () => on_send_again ());
-        add_ctx_action (group, "move", true, () => on_move ());
-        add_ctx_action (group, "archive", !outgoing && !archived, () => on_archive ());
-        add_ctx_action (group, "spam", !outgoing && !junk && has_junk, () => mark_open_spam.begin (true));
-        add_ctx_action (group, "not-spam", !outgoing && junk, () => mark_open_spam.begin (false));
-        add_ctx_action (group, "mark-read", !outgoing && !message.seen, () => mark_open_read.begin ());
-        add_ctx_action (group, "mark-unread", !outgoing && message.seen, () => mark_open_unread.begin ());
-        add_ctx_action (group, "bookmark", !message.is_placeholder, () => toggle_message_bookmark (message));
-        add_ctx_action (group, "mark-important", is_gmail_account () && !outgoing && !message.is_placeholder
+        add_ctx_action (group, "reply", !outgoing && !draft && !outbox, () => on_reply ());
+        add_ctx_action (group, "reply-all", !draft && !outbox, () => on_reply_all ());
+        add_ctx_action (group, "forward", !draft && !outbox, () => on_forward ());
+        add_ctx_action (group, "send-again", (outgoing && !message.is_placeholder) || draft || outbox, () => on_send_again ());
+        add_ctx_action (group, "send-now", outbox, () => {
+            var id = outbox_id_from_message (message);
+            var app = get_application () as Application;
+            if (id != null)
+                app?.outbox?.request_send_now (id);
+            show_toast (_("Sending…"));
+        });
+        add_ctx_action (group, "move", !outbox, () => on_move ());
+        add_ctx_action (group, "archive", !outgoing && !archived && !outbox, () => on_archive ());
+        add_ctx_action (group, "spam", !outgoing && !outbox && !junk && has_junk, () => mark_open_spam.begin (true));
+        add_ctx_action (group, "not-spam", !outgoing && !outbox && junk, () => mark_open_spam.begin (false));
+        add_ctx_action (group, "mark-read", !outgoing && !outbox && !message.seen, () => mark_open_read.begin ());
+        add_ctx_action (group, "mark-unread", !outgoing && !outbox && message.seen, () => mark_open_unread.begin ());
+        add_ctx_action (group, "bookmark", !message.is_placeholder && !outbox, () => toggle_message_bookmark (message));
+        add_ctx_action (group, "mark-important", is_gmail_account () && !outgoing && !outbox && !message.is_placeholder
             && find_folder_kind (FolderKind.IMPORTANT) != null, () => toggle_message_important (message));
-        add_ctx_action (group, "print", true, () => print_open_message.begin ());
+        add_ctx_action (group, "print", !outbox, () => print_open_message.begin ());
         add_ctx_action (group, "delete", true, () => on_delete ());
 
         var menu = new Menu ();
         var compose = new Menu ();
-        if (draft)
+        if (outbox) {
+            compose.append (_("Edit"), "ctx.send-again");
+            compose.append (_("Send Now"), "ctx.send-now");
+        } else if (draft)
             compose.append (_("Edit Draft"), "ctx.send-again");
         else if (outgoing)
             compose.append (_("Send Again"), "ctx.send-again");
         else
             compose.append (_("Reply"), "ctx.reply");
-        if (!draft) {
+        if (!draft && !outbox) {
             compose.append (_("Reply All"), "ctx.reply-all");
             compose.append (_("Forward"), "ctx.forward");
         }
         menu.append_section (null, compose);
 
         var file = new Menu ();
-        file.append (_("Move"), "ctx.move");
-        if (!outgoing && !archived)
-            file.append (_("Archive"), "ctx.archive");
-        if (!outgoing && junk)
-            file.append (_("Not Spam"), "ctx.not-spam");
-        else if (!outgoing && has_junk)
-            file.append (_("Mark as Spam"), "ctx.spam");
-        menu.append_section (null, file);
+        if (!outbox) {
+            file.append (_("Move"), "ctx.move");
+            if (!outgoing && !archived)
+                file.append (_("Archive"), "ctx.archive");
+            if (!outgoing && junk)
+                file.append (_("Not Spam"), "ctx.not-spam");
+            else if (!outgoing && has_junk)
+                file.append (_("Mark as Spam"), "ctx.spam");
+            if (file.get_n_items () > 0)
+                menu.append_section (null, file);
+        }
 
         var flags = new Menu ();
-        if (!outgoing && !message.seen)
-            flags.append (_("Mark as Read"), "ctx.mark-read");
-        if (!outgoing && message.seen)
-            flags.append (_("Mark as Unread"), "ctx.mark-unread");
-        if (!message.is_placeholder)
-            flags.append (message.flagged ? _("Remove Bookmark") : _("Bookmark"), "ctx.bookmark");
-        if (is_gmail_account () && !outgoing && !message.is_placeholder
-            && find_folder_kind (FolderKind.IMPORTANT) != null)
-            flags.append (message.important ? _("Not Important") : _("Mark as Important"), "ctx.mark-important");
-        flags.append (_("Print"), "ctx.print");
-        menu.append_section (null, flags);
+        if (!outbox) {
+            if (!outgoing && !message.seen)
+                flags.append (_("Mark as Read"), "ctx.mark-read");
+            if (!outgoing && message.seen)
+                flags.append (_("Mark as Unread"), "ctx.mark-unread");
+            if (!message.is_placeholder)
+                flags.append (message.flagged ? _("Remove Bookmark") : _("Bookmark"), "ctx.bookmark");
+            if (is_gmail_account () && !outgoing && !message.is_placeholder
+                && find_folder_kind (FolderKind.IMPORTANT) != null)
+                flags.append (message.important ? _("Not Important") : _("Mark as Important"), "ctx.mark-important");
+            flags.append (_("Print"), "ctx.print");
+            if (flags.get_n_items () > 0)
+                menu.append_section (null, flags);
+        }
 
         var remove = new Menu ();
-        remove.append (_("Delete"), "ctx.delete");
+        remove.append (outbox ? _("Cancel Send") : _("Delete"), "ctx.delete");
         menu.append_section (null, remove);
 
         popup_context_menu (widget, menu, group, x, y);
@@ -7360,25 +8466,54 @@ public class Mail.Window : Adw.ApplicationWindow {
     private void refresh_now_all () {
         Utils.sync_log ("manual refresh");
         this.last_full_align = 0;
-        schedule_mail_check (true);
+        clear_all_bulk_refresh_backoff ();
+        schedule_mail_check.begin (true);
         if (this.selected_folder != null)
             boost_folder_sync (this.selected_folder);
     }
 
-    private void schedule_mail_check (bool force_tree) {
+    private async void schedule_mail_check (bool force_tree) {
         var account = this.selected_account;
         if (this.mail_session == null || account == null || account.kind == AccountKind.LOCAL || !account.has_mail)
             return;
 
-        /* Push local flag/move/copy changes before asking the server for new mail. */
+        preempt_background_sync (force_tree ? "manual refresh" : "sync timer");
+
+        /* Commit toast-pending archives/deletes, then wait until Camel has
+         * pushed them before Inbox refresh — otherwise moved mail reappears
+         * and is notified as new. */
         commit_pending_transfer_undo ();
-        this.mail_session.flush_pending_local_changes ();
+        watch_local_flush_status ();
+        /* F5 and sync timer: clear any leftover parks so both paths drain
+         * the same pending move queue. */
+        this.mail_session.unpark_heavy_transfers ();
+        yield this.mail_session.flush_pending_local_changes_async ();
+        if (this.tearing_down || !is_current_account (account))
+            return;
+
+        /* Don't refresh Inbox from Camel while archives/moves are still
+         * flushing — that resurrects mail the UI already hid. Parked heavy
+         * Archive jobs retry later and must not defer mail-check. */
+        if (this.mail_session.has_blocking_local_flushes ()) {
+            Utils.sync_log ("mail check deferred — local flush still running");
+            /* Do not enqueue Archive body fill here: it fights the move queue. */
+            this.mail_session.flush_pending_local_changes ();
+            Timeout.add_seconds (8, () => {
+                if (!this.tearing_down)
+                    schedule_mail_check.begin (false);
+                return Source.REMOVE;
+            });
+            return;
+        }
 
         var full_due = force_tree || this.last_full_align == 0
             || (Utils.sync_tick () - this.last_full_align) >= (int64) FULL_ALIGN_SECONDS * 1000 * 1000;
         if (full_due)
             enqueue_sync_job (SYNC_KIND_TREE, null, RANK_TREE);
         enqueue_new_mail_sync ();
+        /* Resume body fill after the timer (send/preempt may have cancelled it). */
+        enqueue_cache_align ();
+        pump_sync.begin ();
         /* After Inbox work is queued, probe Sent/Archive/… for cold empty
          * lists or warm count drift (mobile / other clients). */
         schedule_folder_scout (force_tree ? 4 : 8);
@@ -7460,6 +8595,7 @@ public class Mail.Window : Adw.ApplicationWindow {
                 refresh_folder_badge (current[i]);
             }
             sync_bookmarks_folder ();
+            sync_outbox_folder ();
             refresh_folder_expanders ();
             apply_folder_collapse ();
             return;
@@ -7484,6 +8620,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
 
         sync_bookmarks_folder ();
+        sync_outbox_folder ();
         refresh_folder_expanders ();
         expand_ancestors_of (selected_name);
         apply_folder_collapse ();
@@ -7516,7 +8653,11 @@ public class Mail.Window : Adw.ApplicationWindow {
             return;
         if (this.search_text.length > 0)
             return;
-        if (folder.is_virtual_view) {
+        if (folder.is_local_outbox) {
+            show_outbox_messages ();
+            return;
+        }
+        if (folder.is_bookmarks_view) {
             show_bookmarked_messages ();
             return;
         }
@@ -7581,7 +8722,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.tearing_down = true;
 
         commit_pending_transfer_undo ();
-        this.mail_session?.flush_pending_local_changes ();
+        /* After prepare_quit: clear if empty, otherwise rewrite the true leftover. */
+        this.mail_session?.persist_mutation_registry_now ();
+        this.mail_session?.flush_prefetch_progress ();
 
         if (this.sync_source != 0) {
             Source.remove (this.sync_source);
@@ -7609,6 +8752,8 @@ public class Mail.Window : Adw.ApplicationWindow {
 
         if (this.mail_session != null) {
             this.mail_session.folder_changed.disconnect (on_camel_folder_changed);
+            this.mail_session.send_starting.disconnect (on_send_starting);
+            this.mail_session.send_finished.disconnect (on_send_finished);
             this.mail_session.message_sent.disconnect (on_message_sent);
             this.mail_session.draft_saved.disconnect (on_draft_saved);
             this.mail_session.draft_removed.disconnect (on_draft_removed);
@@ -7660,4 +8805,6 @@ private class Mail.MailSyncJob : Object {
     public int kind;
     public Folder? folder;
     public int rank;
+    /* 0 = default HIGH/LOW timeouts; REFRESH_INFO_SKIP = Camel merge only. */
+    public uint refresh_timeout_seconds;
 }
