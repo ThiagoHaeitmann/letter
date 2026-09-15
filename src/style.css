@@ -71,6 +71,21 @@
   min-width: 240px;
 }
 
+.bulk-reader-actions {
+  margin-top: 8px;
+  max-width: 380px;
+}
+
+.bulk-reader-actions button.pill {
+  min-height: 28px;
+  padding: 2px 10px;
+  font-size: 0.9em;
+}
+
+.bulk-reader-actions button.pill image {
+  -gtk-icon-size: 16px;
+}
+
 .welcome-footer {
   padding: 10px 16px 12px 16px;
 }
@@ -342,6 +357,10 @@ webview.message-body {
 }
 
 .priority-badge-icon {
+  color: #b42318;
+}
+
+.compose-priority-toggle:checked {
   color: #b42318;
 }
 

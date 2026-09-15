@@ -1637,6 +1637,7 @@ public class Mail.MailSession : Camel.Session {
             ),
             local_only = uid.has_prefix ("local-sent-") || uid.has_prefix ("local-draft-"),
             search_blob = blob.str,
+            important = MessageContent.mime_has_high_priority (mime),
         };
     }
 
@@ -5266,7 +5267,8 @@ public class Mail.MailSession : Camel.Session {
         GenericArray<Attachment>? attachments = null,
         MessageContent? reply_of = null,
         Cancellable? cancellable = null,
-        bool is_forward = false
+        bool is_forward = false,
+        bool high_priority = false
     ) throws Error {
         ensure_can_send (account, to, cc, bcc);
         var identity = get_identity (account);
@@ -5296,7 +5298,8 @@ public class Mail.MailSession : Camel.Session {
             html,
             attachments,
             reply_of,
-            is_forward
+            is_forward,
+            high_priority
         );
 
         var transport = yield open_transport (account, cancellable);
@@ -5366,6 +5369,7 @@ public class Mail.MailSession : Camel.Session {
         GenericArray<Attachment>? attachments = null,
         MessageContent? reply_of = null,
         bool is_forward = false,
+        bool high_priority = false,
         Cancellable? cancellable = null,
         string? replace_uid = null,
         Folder? replace_folder = null,
@@ -5390,7 +5394,8 @@ public class Mail.MailSession : Camel.Session {
             html,
             attachments,
             reply_of,
-            is_forward
+            is_forward,
+            high_priority
         );
         Folder? drafts;
         var uid = yield save_to_folder (account, FolderKind.DRAFTS, mime, cancellable, out drafts);
@@ -5428,7 +5433,8 @@ public class Mail.MailSession : Camel.Session {
         string? html,
         GenericArray<Attachment>? attachments,
         MessageContent? reply_of = null,
-        bool is_forward = false
+        bool is_forward = false,
+        bool high_priority = false
     ) {
         var from_addr = new Camel.InternetAddress ();
         from_addr.add (identity.name, identity.address);
@@ -5444,6 +5450,7 @@ public class Mail.MailSession : Camel.Session {
         mime.set_subject (subject.strip ().length > 0 ? subject.strip () : _("(No subject)"));
         mime.set_date ((time_t) new DateTime.now_local ().to_unix (), 0);
         apply_outgoing_thread_headers (mime, identity, reply_of, is_forward);
+        MessageContent.apply_priority_headers (mime, high_priority);
 
         var plain = body ?? "";
         var has_html = html != null && html.strip ().length > 0;
@@ -6200,6 +6207,42 @@ public class Mail.MessageContent : Object {
     public string? thread_index { get; set; }
     public string? thread_topic { get; set; }
     public string? conversation_id { get; set; }
+    public bool high_priority { get; set; }
+
+    public static bool mime_has_high_priority (Camel.MimeMessage mime) {
+        var medium = (Camel.Medium) mime;
+        var importance = (medium.get_header ("Importance") ?? "").strip ().down ();
+        if (importance == "high")
+            return true;
+        var ms = (medium.get_header ("X-MSMail-Priority") ?? "").strip ().down ();
+        if (ms == "high")
+            return true;
+        var priority = (medium.get_header ("Priority") ?? "").strip ().down ();
+        if (priority == "urgent")
+            return true;
+        var x_priority = (medium.get_header ("X-Priority") ?? "").strip ();
+        if (x_priority.length > 0) {
+            var first = x_priority.get_char (0);
+            if (first == '1' || first == '2')
+                return true;
+        }
+        return false;
+    }
+
+    public static void apply_priority_headers (Camel.MimeMessage mime, bool high) {
+        var medium = (Camel.Medium) mime;
+        if (high) {
+            medium.set_header ("Importance", "high");
+            medium.set_header ("X-Priority", "1");
+            medium.set_header ("Priority", "urgent");
+            medium.set_header ("X-MSMail-Priority", "High");
+            return;
+        }
+        medium.remove_header ("Importance");
+        medium.remove_header ("X-Priority");
+        medium.remove_header ("Priority");
+        medium.remove_header ("X-MSMail-Priority");
+    }
 
     public static MessageContent from_mime (string uid, Camel.MimeMessage mime) {
         var subject = mime.get_subject ();
@@ -6287,6 +6330,7 @@ public class Mail.MessageContent : Object {
             thread_index = ((Camel.Medium) mime).get_header ("Thread-Index"),
             thread_topic = ((Camel.Medium) mime).get_header ("Thread-Topic"),
             conversation_id = ((Camel.Medium) mime).get_header ("Conversation-ID"),
+            high_priority = mime_has_high_priority (mime),
         };
     }
 

@@ -17,6 +17,7 @@ public class Mail.PendingMail : Object {
     public int64 next_attempt_us { get; set; }
     public string? last_error { get; set; }
     public int64 updated_us { get; set; }
+    public bool high_priority { get; set; }
     public GenericArray<string> attachment_names = new GenericArray<string> ();
 
     public string display_subject {
@@ -104,7 +105,8 @@ public class Mail.OutboxStore : Object {
         string html,
         bool is_forward,
         MessageContent? thread_of,
-        GenericArray<Attachment> attachments
+        GenericArray<Attachment> attachments,
+        bool high_priority = false
     ) throws Error {
         ensure_dirs ();
         var id = new_id ();
@@ -121,6 +123,7 @@ public class Mail.OutboxStore : Object {
             plain = plain ?? "",
             html = html ?? "",
             is_forward = is_forward,
+            high_priority = high_priority,
             attempts = 0,
             next_attempt_us = 0,
             updated_us = wall_tick (),
@@ -287,7 +290,8 @@ public class Mail.OutboxStore : Object {
                 attachments,
                 thread,
                 null,
-                item.is_forward
+                item.is_forward,
+                item.high_priority
             );
             Utils.sync_log ("outbox send ok “%s”".printf (item.display_subject));
             return true;
@@ -390,6 +394,7 @@ public class Mail.OutboxStore : Object {
                 bcc = key.has_key ("mail", "bcc") ? key.get_string ("mail", "bcc") : "",
                 subject = key.has_key ("mail", "subject") ? key.get_string ("mail", "subject") : "",
                 is_forward = key.has_key ("mail", "forward") && key.get_boolean ("mail", "forward"),
+                high_priority = key.has_key ("mail", "high-priority") && key.get_boolean ("mail", "high-priority"),
                 attempts = key.has_key ("mail", "attempts") ? key.get_integer ("mail", "attempts") : 0,
                 next_attempt_us = key.has_key ("mail", "next") ? key.get_int64 ("mail", "next") : 0,
                 updated_us = key.has_key ("mail", "updated") ? key.get_int64 ("mail", "updated") : 0,
@@ -434,6 +439,7 @@ public class Mail.OutboxStore : Object {
         key.set_string ("mail", "bcc", item.bcc ?? "");
         key.set_string ("mail", "subject", item.subject ?? "");
         key.set_boolean ("mail", "forward", item.is_forward);
+        key.set_boolean ("mail", "high-priority", item.high_priority);
         key.set_integer ("mail", "attempts", (int) item.attempts);
         key.set_int64 ("mail", "next", item.next_attempt_us);
         key.set_int64 ("mail", "updated", item.updated_us);

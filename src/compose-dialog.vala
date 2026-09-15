@@ -54,6 +54,8 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
     private Message? editing_draft;
     private Folder? editing_draft_folder;
     private Account? editing_draft_account;
+    private Gtk.ToggleButton priority_toggle;
+    private bool initial_high_priority;
 
     public ComposeWindow (
         Gtk.Application app,
@@ -91,6 +93,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         this.reply_of = (!forward_quote && !edit_body) ? quoted : null;
         this.thread_of = thread_parent_for_compose (quoted, forward_quote, edit_body, editing);
         this.is_forward = forward_quote;
+        this.initial_high_priority = edit_body && quoted != null && quoted.high_priority;
         this.focus_to_field = quoted == null || forward_quote;
         this.skip_initial_signature = edit_body;
         resizable = true;
@@ -620,7 +623,8 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
             || this.cc_row.text != this.initial_cc
             || this.bcc_row.text != this.initial_bcc
             || this.subject_row.text != this.initial_subject
-            || this.attachments.length != this.initial_attachment_count;
+            || this.attachments.length != this.initial_attachment_count
+            || this.priority_toggle.active != this.initial_high_priority;
     }
 
     private bool has_unsaved_changes (string? plain_body = null) {
@@ -743,6 +747,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
             this.attachments,
             this.thread_of,
             this.is_forward,
+            this.priority_toggle.active,
             null,
             replace_uid,
             replace_folder,
@@ -761,6 +766,7 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         this.initial_bcc = this.bcc_row.text;
         this.initial_subject = this.subject_row.text;
         this.initial_attachment_count = this.attachments.length;
+        this.initial_high_priority = this.priority_toggle.active;
         try {
             this.initial_body = yield this.body_view.get_plain ();
         } catch (Error e) {
@@ -856,7 +862,8 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
                 html,
                 this.is_forward,
                 thread_of,
-                attachments
+                attachments,
+                this.priority_toggle.active
             );
         } catch (Error enqueue_error) {
             this.sending = false;
@@ -1000,6 +1007,23 @@ public class Mail.ComposeWindow : Adw.ApplicationWindow {
         attach.add_css_class ("flat");
         attach.clicked.connect (() => attach_files.begin ());
         bar.append (attach);
+
+        this.priority_toggle = new Gtk.ToggleButton () {
+            icon_name = "mail-mark-important-symbolic",
+            valign = Gtk.Align.CENTER,
+            tooltip_text = _("High priority"),
+            active = this.initial_high_priority,
+        };
+        this.priority_toggle.add_css_class ("flat");
+        this.priority_toggle.add_css_class ("compose-priority-toggle");
+        this.priority_toggle.toggled.connect (() => {
+            this.priority_toggle.tooltip_text = this.priority_toggle.active
+                ? _("High priority (on)")
+                : _("High priority");
+        });
+        if (this.priority_toggle.active)
+            this.priority_toggle.tooltip_text = _("High priority (on)");
+        bar.append (this.priority_toggle);
 
         var bcc = new Gtk.ToggleButton () {
             label = _("Bcc"),

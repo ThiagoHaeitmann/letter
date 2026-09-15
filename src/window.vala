@@ -60,6 +60,7 @@ public class Mail.Window : Adw.ApplicationWindow {
     private unowned Adw.Bin reader_bin;
     [GtkChild]
     private unowned Adw.StatusPage reader_page;
+    private Gtk.Widget? bulk_reader_actions;
     [GtkChild]
     private unowned Adw.Spinner conversation_sync_spinner;
     [GtkChild]
@@ -1291,6 +1292,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             message_id = item.reply_message_id,
             in_reply_to = item.reply_in_reply_to,
             attachments = attachments,
+            high_priority = item.high_priority,
         };
         var compose = new ComposeWindow (
             app,
@@ -5316,9 +5318,64 @@ public class Mail.Window : Adw.ApplicationWindow {
             "%u conversations selected",
             n
         ).printf (n);
-        this.reader_page.description = _("Archive, move, delete, or mark as read or unread.");
+        this.reader_page.description = null;
+        this.reader_page.child = ensure_bulk_reader_actions ();
         this.reader_bin.child = this.reader_page;
         update_message_actions ();
+    }
+
+    private Gtk.Widget ensure_bulk_reader_actions () {
+        if (this.bulk_reader_actions != null)
+            return this.bulk_reader_actions;
+
+        var box = new Adw.WrapBox () {
+            child_spacing = 8,
+            line_spacing = 8,
+            justify = Adw.JustifyMode.FILL,
+            align = 0.5f,
+            halign = Gtk.Align.CENTER,
+            hexpand = true,
+        };
+        box.add_css_class ("bulk-reader-actions");
+        box.append (bulk_reader_button (
+            "package-x-generic-symbolic",
+            _("Archive"),
+            "win.archive"
+        ));
+        box.append (bulk_reader_button (
+            "folder-symbolic",
+            _("Move"),
+            "win.move"
+        ));
+        box.append (bulk_reader_button (
+            "mail-read-symbolic",
+            _("Mark as Read"),
+            "win.mark-read"
+        ));
+        box.append (bulk_reader_button (
+            "mail-unread-symbolic",
+            _("Mark as Unread"),
+            "win.mark-unread"
+        ));
+        box.append (bulk_reader_button (
+            "user-trash-symbolic",
+            _("Delete"),
+            "win.delete"
+        ));
+        this.bulk_reader_actions = box;
+        return box;
+    }
+
+    private static Gtk.Button bulk_reader_button (string icon, string label, string action) {
+        var button = new Gtk.Button () {
+            action_name = action,
+            child = new Adw.ButtonContent () {
+                icon_name = icon,
+                label = label,
+            },
+        };
+        button.add_css_class ("pill");
+        return button;
     }
 
     private void on_message_selection_changed () {
@@ -5679,6 +5736,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.reader_page.icon_name = "mail-unread-symbolic";
         this.reader_page.title = _("Select a Message");
         this.reader_page.description = _("Choose a message from the list to read it.");
+        this.reader_page.child = null;
         this.reader_bin.child = this.reader_page;
         if (this.thread_action_bar != null)
             this.thread_action_bar.visible = false;
