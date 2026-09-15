@@ -3322,7 +3322,12 @@ blockquote:not(.mail-quote) {
                 }
 
                 function notifyImagePresence() {
-                    var n = editor.querySelectorAll('img').length;
+                    var images = editor.querySelectorAll('img');
+                    var n = 0;
+                    for (var i = 0; i < images.length; i++) {
+                        if (resizableImage(images[i]))
+                            n++;
+                    }
                     postCompose('imgcount|' + n);
                 }
 
@@ -3590,10 +3595,20 @@ blockquote:not(.mail-quote) {
 
                 window.mailCompose = {
                     bindLastImage: function (id) {
-                        var images = editor.querySelectorAll('img');
-                        if (!images.length)
+                        var img = id
+                            ? editor.querySelector('img[data-mail-id="' + id + '"]')
+                            : null;
+                        if (!img) {
+                            var images = editor.querySelectorAll('img');
+                            for (var i = images.length - 1; i >= 0; i--) {
+                                if (resizableImage(images[i])) {
+                                    img = images[i];
+                                    break;
+                                }
+                            }
+                        }
+                        if (!img || !resizableImage(img))
                             return;
-                        var img = images[images.length - 1];
                         img.classList.add('mail-inline-image');
                         img.setAttribute('draggable', 'true');
                         img.setAttribute('data-mail-id', id);
@@ -3717,9 +3732,13 @@ blockquote:not(.mail-quote) {
                         document.execCommand('insertText', false, word);
                     },
                     selectLastImage: function () {
-                        var images = editor.querySelectorAll('img.mail-inline-image');
-                        if (images.length)
-                            selectImage(images[images.length - 1]);
+                        var images = editor.querySelectorAll('img');
+                        for (var i = images.length - 1; i >= 0; i--) {
+                            if (resizableImage(images[i])) {
+                                selectImage(images[i]);
+                                return;
+                            }
+                        }
                     }
                 };
 

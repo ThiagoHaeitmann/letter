@@ -43,6 +43,8 @@ a just-saved draft appears in Letter without waiting for the next mail check.
 - Large Archive / Sent folders no longer keep retrying endless server refreshes  
 when Microsoft 365 Online Archive makes message counts drift.
 - Context menu **Update Folder** runs a thorough server high priority align for that folder. 
+- Compose image-size controls ignore images inside the signature (and quoted
+  mail); the signature editor still offers resize for its own images.
 
 
 
