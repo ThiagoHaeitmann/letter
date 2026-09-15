@@ -24,6 +24,9 @@ public class Mail.MailSession : Camel.Session {
     private bool flush_force;
     /* Active move Graph call — cancelled when send preempts the flush. */
     private Cancellable? transfer_op_cancellable;
+    /* Active SEEN/flag synchronize — cancelled when send (or other high
+     * Camel work) needs the lock during a bulk mark-all push. */
+    private Cancellable? flag_op_cancellable;
     private HashTable<string, FolderWatch> folder_watches;
     private HashTable<string, int> prefetch_cursor;
     /* M365 accounts whose Camel folder-tree already has TYPE_TRASH/JUNK. */
@@ -975,12 +978,17 @@ public class Mail.MailSession : Camel.Session {
             if (high && spins >= 100) {
                 var flush_holds = this.transfer_flush_running || this.flag_flush_running;
                 if (flush_holds && this.send_waiters > 0) {
-                    /* Ask the in-flight move to abort; flush pauses on send_waiters
-                     * between UIDs. Steal only if Graph ignores cancel. */
+                    /* Ask in-flight move/flag Graph work to abort; flushes pause
+                     * on send_waiters between chunks. Steal only if cancel is ignored. */
                     if (this.transfer_op_cancellable != null
                         && !this.transfer_op_cancellable.is_cancelled ()) {
                         Utils.sync_log ("Camel lock: cancelling move so send can proceed");
                         this.transfer_op_cancellable.cancel ();
+                    }
+                    if (this.flag_op_cancellable != null
+                        && !this.flag_op_cancellable.is_cancelled ()) {
+                        Utils.sync_log ("Camel lock: cancelling flag sync so send can proceed");
+                        this.flag_op_cancellable.cancel ();
                     }
                     if (spins >= 500) {
                         Utils.sync_log ("Camel lock: send preempting local flush");
@@ -991,6 +999,14 @@ public class Mail.MailSession : Camel.Session {
                     if (spins == 100 || spins % 100 == 0) {
                         Utils.sync_log ("Camel lock: waiting for flush to yield to send");
                     }
+                } else if (flush_holds
+                    && this.flag_op_cancellable != null
+                    && !this.flag_op_cancellable.is_cancelled ()) {
+                    /* Draft / open-body: abort bulk SEEN synchronize so high work
+                     * can take Camel. Do not cancel in-flight moves (open-body
+                     * must not interrupt Graph transfers). */
+                    Utils.sync_log ("Camel lock: cancelling flag sync for priority work");
+                    this.flag_op_cancellable.cancel ();
                 } else if (spins >= 1000) {
                     if (flush_holds) {
                         if (spins == 1000 || spins % 500 == 0) {
@@ -3255,6 +3271,11 @@ public class Mail.MailSession : Camel.Session {
         apply_camel_counts (folder, camel_folder);
         if (folder.kind == FolderKind.DRAFTS)
             draft_removed (account, folder, uid);
+        /* Queue DELETED so the replaced draft disappears on the server too;
+         * without this, each autosave left another live Drafts copy on M365. */
+        var uids = new GenericArray<string> ();
+        uids.add (uid);
+        enqueue_flag_flush (account, folder, uids);
     }
 
     public async void delete_uids (Account account, Folder folder, GenericArray<string> uids, Folder? trash) throws Error {
@@ -3663,28 +3684,46 @@ public class Mail.MailSession : Camel.Session {
         }
 
         var t0 = Utils.sync_tick ();
-        var logged_pause = false;
+        var logged_send_pause = false;
+        var logged_user_pause = false;
         var done = 0u;
         while (done < job.uids.length) {
             if (this.flag_flush_latest.get (key) != job)
                 return;
 
-            /* While archive/move flush owns Camel, do not yield SEEN/flag pushes
-             * to open-body — that parked flag flush for minutes (180s+). */
-            if (this.high_refresh_waiters > 0 && !this.flush_force) {
-                if (!logged_pause) {
+            /* Soft SEEN/flag pushes yield to Send like move flush. Expunge stays
+             * exclusive (Empty Trash / hard-delete). */
+            if (this.send_waiters > 0 && !job.expunge) {
+                if (!logged_send_pause) {
+                    Utils.sync_log ("flag flush paused “%s” for send (%u/%u)".printf (
+                        job.folder.name,
+                        done,
+                        job.uids.length
+                    ));
+                    logged_send_pause = true;
+                }
+                Timeout.add (100, flush_folder_flags.callback);
+                yield;
+                continue;
+            }
+            logged_send_pause = false;
+
+            /* Pause before starting sync when draft/open-body already holds or
+             * is entering Camel. Mid-flight cancel uses flag_op_cancellable. */
+            if (this.high_refresh_waiters > 0 && !this.flush_force && !job.expunge) {
+                if (!logged_user_pause) {
                     Utils.sync_log ("flag flush paused “%s” for user (%u/%u)".printf (
                         job.folder.name,
                         done,
                         job.uids.length
                     ));
-                    logged_pause = true;
+                    logged_user_pause = true;
                 }
                 Timeout.add (250, flush_folder_flags.callback);
                 yield;
                 continue;
             }
-            logged_pause = false;
+            logged_user_pause = false;
 
             /* Expunge jobs (Empty Trash / hard-delete) take HIGH so account
              * switch / open-body do not starve the purge for minutes. */
@@ -3699,16 +3738,38 @@ public class Mail.MailSession : Camel.Session {
                         true,
                         null
                     );
+                    done = job.uids.length;
                 } else {
                     yield enter_camel (false);
+                    ulong parent_id = 0;
+                    uint timeout_id = 0;
+                    /* Generous wall clock for bulk mark-all; Send/draft cancel
+                     * mid-flight via flag_op_cancellable. */
+                    var timed = bound_cancellable (null, 300, out parent_id, out timeout_id);
+                    this.flag_op_cancellable = timed;
                     try {
-                        yield camel_folder.synchronize (false, Priority.LOW, null);
+                        yield camel_folder.synchronize (false, Priority.LOW, timed);
+                        done = job.uids.length;
                     } finally {
+                        if (this.flag_op_cancellable == timed)
+                            this.flag_op_cancellable = null;
+                        unbind_cancellable (null, parent_id, timeout_id);
                         leave_camel (false);
                     }
                 }
-                done = job.uids.length;
             } catch (Error e) {
+                if (Utils.is_cancelled_error (e)) {
+                    /* Dirty SEEN flags stay in Camel; keep the job and resume
+                     * after Send / draft / open-body releases the lock. */
+                    if (this.flag_flush_latest.get (key) == job)
+                        this.flag_flush_queue.add (job);
+                    Utils.sync_log ("flag flush interrupted “%s” — requeued (%u messages)".printf (
+                        job.folder.name,
+                        job.uids.length
+                    ));
+                    schedule_mutation_registry_save ();
+                    return;
+                }
                 warning ("Could not push folder flags for “%s”: %s", job.folder.name, e.message);
                 done = job.uids.length;
             }

@@ -1318,9 +1318,17 @@ msgstr "Allega"
 msgid "Save this message as a draft?"
 msgstr "Salvare questo messaggio come bozza?"
 
+#: src/compose-dialog.vala:641
+msgid "Save changes to draft?"
+msgstr "Salvare le modifiche alla bozza?"
+
 #: src/compose-dialog.vala:642
 msgid "It will be stored in Drafts so you can finish it later."
 msgstr "Verrà salvato in Bozze per poterlo completare più tardi."
+
+#: src/compose-dialog.vala:642
+msgid "Your latest edits will update the draft in Drafts."
+msgstr "Le ultime modifiche aggiorneranno la bozza in Bozze."
 
 #: src/compose-dialog.vala:644
 msgid "Discard"
@@ -1329,6 +1337,10 @@ msgstr "Scarta"
 #: src/compose-dialog.vala:645
 msgid "Keep Editing"
 msgstr "Continua a modificare"
+
+#: src/compose-dialog.vala:646
+msgid "Save Changes"
+msgstr "Salva modifiche"
 
 #: src/compose-dialog.vala:718
 msgid "Saved to Drafts"
@@ -1583,8 +1595,8 @@ msgid "Image Size"
 msgstr "Dimensione immagine"
 
 #: src/compose-dialog.vala:2329
-msgid "Paste as Plain Text"
-msgstr "Incolla come testo semplice"
+msgid "Paste and Match Style"
+msgstr "Incolla associando lo stile"
 
 #: src/compose-dialog.vala:2335
 msgid "Ignore Spelling"

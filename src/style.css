@@ -506,6 +506,10 @@ button.recipient-more label {
   padding: 4px;
 }
 
+.compose-toolbar togglebutton.compose-format-mixed {
+  opacity: 0.55;
+}
+
 .compose-highlight-glyph {
   font-weight: 700;
   font-size: 11px;

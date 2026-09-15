@@ -1281,8 +1281,16 @@ msgstr ""
 msgid "Save this message as a draft?"
 msgstr ""
 
+#: src/compose-dialog.vala:641
+msgid "Save changes to draft?"
+msgstr ""
+
 #: src/compose-dialog.vala:642
 msgid "It will be stored in Drafts so you can finish it later."
+msgstr ""
+
+#: src/compose-dialog.vala:642
+msgid "Your latest edits will update the draft in Drafts."
 msgstr ""
 
 #: src/compose-dialog.vala:644
@@ -1291,6 +1299,10 @@ msgstr ""
 
 #: src/compose-dialog.vala:645
 msgid "Keep Editing"
+msgstr ""
+
+#: src/compose-dialog.vala:646
+msgid "Save Changes"
 msgstr ""
 
 #: src/compose-dialog.vala:718
@@ -1542,7 +1554,7 @@ msgid "Image Size"
 msgstr ""
 
 #: src/compose-dialog.vala:2329
-msgid "Paste as Plain Text"
+msgid "Paste and Match Style"
 msgstr ""
 
 #: src/compose-dialog.vala:2335

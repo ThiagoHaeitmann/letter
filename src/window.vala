@@ -990,7 +990,14 @@ public class Mail.Window : Adw.ApplicationWindow {
             var camel_total = yield this.mail_session.local_uid_count (account, folder, cancellable);
             if (cancellable != null && cancellable.is_cancelled ())
                 return false;
-            if (!folder_summary_looks_incomplete (camel_total, header_count))
+            /* Drafts / Sent grow by one on compose save — the bulk incompleteness
+             * heuristic would miss a single new UID and leave the list stale. */
+            var lag = false;
+            if (folder.kind == FolderKind.DRAFTS || folder.kind == FolderKind.SENT)
+                lag = camel_total > (int) header_count;
+            else
+                lag = folder_summary_looks_incomplete (camel_total, header_count);
+            if (!lag)
                 return false;
             folder.total = int.max (folder.total, camel_total);
             refresh_folder_badge (folder);
@@ -3893,8 +3900,12 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
         }
         cached = this.message_cache.get (cache_key);
-        /* No Graph on folder open. Incomplete lists wait for tip / startup /
-         * Update Folder; hydrate above already merged Camel-local headers. */
+        /* No Graph on folder open (Archive/Inbox/…). Drafts is the exception:
+         * compose append hits the server immediately, but Letter stays
+         * cache-first — a brief tip align on open picks up the new UID without
+         * a full Update Folder. */
+        if (folder.kind == FolderKind.DRAFTS)
+            maybe_enqueue_drafts_open_brief (account, folder);
         if ((cached == null || cached.length == 0)
             && (folder.total > 0 || folder.unread > 0 || hint_total > 0 || hint_unread > 0)
             && !folder_is_incoming_watch (folder)
@@ -3911,6 +3922,29 @@ public class Mail.Window : Adw.ApplicationWindow {
             refresh_folder_badge (folder);
             show_folder_cache_align_loading (folder);
         }
+    }
+
+    /* Avoid hammering Graph if the user re-opens Drafts within this window. */
+    private const int64 DRAFTS_OPEN_BRIEF_COOLDOWN = 20 * TimeSpan.SECOND;
+
+    private void maybe_enqueue_drafts_open_brief (Account account, Folder folder) {
+        if (this.mail_session == null || account.kind == AccountKind.LOCAL || !account.has_mail)
+            return;
+        if (!network_is_available ())
+            return;
+        if (tip_refresh_age (account, folder) < DRAFTS_OPEN_BRIEF_COOLDOWN)
+            return;
+        mark_tip_refresh (account, folder);
+        enqueue_sync_job (
+            SYNC_KIND_HEADERS,
+            folder,
+            RANK_NEW_MAIL,
+            MailSession.REFRESH_INFO_BRIEF
+        );
+        Utils.sync_log ("Drafts open — brief server tip queued (%us)".printf (
+            MailSession.REFRESH_INFO_BRIEF
+        ));
+        pump_sync.begin ();
     }
 
     private static bool network_is_available () {

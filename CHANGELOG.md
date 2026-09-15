@@ -21,8 +21,17 @@ refactors unless they affect behaviour.
 
 
 
+### Added
+
+- Compose context menu **Paste and Match Style** (also Ctrl+Shift+V) pastes
+clipboard text using the font and size you are already typing with.
+
+
+
 ### Changed
 
+- Opening **Drafts** does a short server tip refresh (with a small cooldown) so
+a just-saved draft appears in Letter without waiting for the next mail check.
 - Large Archive / Sent folders no longer keep retrying endless server refreshes  
 when Microsoft 365 Online Archive makes message counts drift.
 - Context menu **Update Folder** runs a thorough server high priority align for that folder. 
@@ -31,6 +40,16 @@ when Microsoft 365 Online Archive makes message counts drift.
 
 ### Fixed
 
+- Compose keeps a single Drafts copy per message: later autosaves replace the
+previous revision instead of leaving duplicates, and closing after further
+edits asks to save those changes again. Opening Drafts also rebuilds from
+Camel when even a single new local UID is missing from the list.
+- Bulk **Mark All as Read** no longer blocks Send or draft save: flag upload
+pauses for outbound mail, can be cancelled mid-flight, then resumes with the
+remaining dirty SEEN flags still durable on disk.
+- Compose format bar now shows the font, size, and bold/italic/underline/strike
+under the caret or selection. Dropdowns clear when the face is not in Letter’s
+font list or when the selection mixes different fonts or sizes.
 - Compose / Sent recipient chips no longer glue bare addresses into the next
 `Name <email>` entry when the To list mixes plain emails and display names
 (also repairs “Send again” and older mangled Sent headers when possible).

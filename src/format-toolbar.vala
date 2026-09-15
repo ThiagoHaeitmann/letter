@@ -3,6 +3,13 @@ public class Mail.FormatToolbar : Gtk.Box {
 
     private ComposeHtmlView view;
     private GenericArray<string> font_families = new GenericArray<string> ();
+    private Gtk.DropDown font_drop;
+    private Gtk.DropDown size_drop;
+    private Gtk.ToggleButton bold_toggle;
+    private Gtk.ToggleButton italic_toggle;
+    private Gtk.ToggleButton underline_toggle;
+    private Gtk.ToggleButton strike_toggle;
+    private bool toolbar_live = true;
 
     public FormatToolbar (ComposeHtmlView view) {
         Object (orientation: Gtk.Orientation.HORIZONTAL, spacing: 6);
@@ -12,17 +19,19 @@ public class Mail.FormatToolbar : Gtk.Box {
         valign = Gtk.Align.CENTER;
         add_css_class ("compose-toolbar");
 
-        var font_drop = build_font_drop ();
-        font_drop.add_css_class ("compose-font-drop");
-        font_drop.tooltip_text = _("Font");
-        font_drop.enable_search = true;
-        font_drop.notify["selected"].connect (() => {
-            var index = font_drop.selected;
+        this.font_drop = build_font_drop ();
+        this.font_drop.add_css_class ("compose-font-drop");
+        this.font_drop.tooltip_text = _("Font");
+        this.font_drop.enable_search = true;
+        this.font_drop.notify["selected"].connect (() => {
+            if (!this.toolbar_live)
+                return;
+            var index = this.font_drop.selected;
             if (index < this.font_families.length)
                 this.view.apply_font (this.font_families[index]);
         });
 
-        var size_drop = new Gtk.DropDown.from_strings ({
+        this.size_drop = new Gtk.DropDown.from_strings ({
             _("Small"),
             _("Normal"),
             _("Large"),
@@ -33,31 +42,79 @@ public class Mail.FormatToolbar : Gtk.Box {
             vexpand = false,
             tooltip_text = _("Font size"),
         };
-        size_drop.add_css_class ("compose-size-drop");
-        size_drop.notify["selected"].connect (() => {
+        this.size_drop.add_css_class ("compose-size-drop");
+        this.size_drop.notify["selected"].connect (() => {
+            if (!this.toolbar_live)
+                return;
             string[] sizes = { "2", "3", "4", "6" };
-            var index = size_drop.selected;
+            var index = this.size_drop.selected;
             if (index < sizes.length)
                 this.view.apply_size (sizes[index]);
         });
 
-        append (font_drop);
-        append (size_drop);
+        this.view.format_state_changed.connect (on_format_state_changed);
+
+        append (this.font_drop);
+        append (this.size_drop);
 
         var formats = new Gtk.Box (Gtk.Orientation.HORIZONTAL, 4) {
             hexpand = true,
             vexpand = false,
             valign = Gtk.Align.CENTER,
         };
-        formats.append (command_button ("format-text-bold-symbolic", _("Bold"), "Bold"));
-        formats.append (command_button ("format-text-italic-symbolic", _("Italic"), "Italic"));
-        formats.append (command_button ("format-text-underline-symbolic", _("Underline"), "Underline"));
-        formats.append (command_button ("format-text-strikethrough-symbolic", _("Strikethrough"), "Strikethrough"));
+        this.bold_toggle = format_toggle_button ("format-text-bold-symbolic", _("Bold"), "Bold");
+        this.italic_toggle = format_toggle_button ("format-text-italic-symbolic", _("Italic"), "Italic");
+        this.underline_toggle = format_toggle_button ("format-text-underline-symbolic", _("Underline"), "Underline");
+        this.strike_toggle = format_toggle_button ("format-text-strikethrough-symbolic", _("Strikethrough"), "Strikethrough");
+        formats.append (this.bold_toggle);
+        formats.append (this.italic_toggle);
+        formats.append (this.underline_toggle);
+        formats.append (this.strike_toggle);
         formats.append (color_menu_button ());
         formats.append (emoji_button ());
         formats.append (icon_button ("image-x-generic-symbolic", _("Insert Image"), () => insert_image ()));
         formats.append (this.view.create_image_size_drop ());
         append (formats);
+    }
+
+    private void on_format_state_changed (
+        string font,
+        string size,
+        string bold,
+        string italic,
+        string underline,
+        string strike
+    ) {
+        this.toolbar_live = false;
+        var font_index = ComposeHtmlView.font_family_index (this.font_families, font);
+        this.font_drop.selected = font_index >= 0
+            ? (uint) font_index
+            : Gtk.INVALID_LIST_POSITION;
+        var size_index = ComposeHtmlView.font_size_index (size);
+        this.size_drop.selected = size_index >= 0
+            ? (uint) size_index
+            : Gtk.INVALID_LIST_POSITION;
+        ComposeHtmlView.apply_format_toggle (this.bold_toggle, bold);
+        ComposeHtmlView.apply_format_toggle (this.italic_toggle, italic);
+        ComposeHtmlView.apply_format_toggle (this.underline_toggle, underline);
+        ComposeHtmlView.apply_format_toggle (this.strike_toggle, strike);
+        this.toolbar_live = true;
+    }
+
+    private Gtk.ToggleButton format_toggle_button (string icon, string tooltip, string command) {
+        var button = new Gtk.ToggleButton () {
+            icon_name = icon,
+            valign = Gtk.Align.CENTER,
+            tooltip_text = tooltip,
+            focus_on_click = false,
+        };
+        button.add_css_class ("flat");
+        button.toggled.connect (() => {
+            if (!this.toolbar_live)
+                return;
+            this.view.apply_command (command);
+        });
+        return button;
     }
 
     private Gtk.Button command_button (string icon, string tooltip, string command) {

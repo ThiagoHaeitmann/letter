@@ -1326,10 +1326,18 @@ msgstr "Anhängen"
 msgid "Save this message as a draft?"
 msgstr "Diese Nachricht als Entwurf speichern?"
 
+#: src/compose-dialog.vala:641
+msgid "Save changes to draft?"
+msgstr "Änderungen am Entwurf speichern?"
+
 #: src/compose-dialog.vala:642
 msgid "It will be stored in Drafts so you can finish it later."
 msgstr ""
 "Sie wird in Entwürfe gespeichert, sodass Sie sie später fertigstellen können."
+
+#: src/compose-dialog.vala:642
+msgid "Your latest edits will update the draft in Drafts."
+msgstr "Ihre letzten Änderungen aktualisieren den Entwurf in Entwürfe."
 
 #: src/compose-dialog.vala:644
 msgid "Discard"
@@ -1338,6 +1346,10 @@ msgstr "Verwerfen"
 #: src/compose-dialog.vala:645
 msgid "Keep Editing"
 msgstr "Weiter bearbeiten"
+
+#: src/compose-dialog.vala:646
+msgid "Save Changes"
+msgstr "Änderungen speichern"
 
 #: src/compose-dialog.vala:718
 msgid "Saved to Drafts"
@@ -1594,8 +1606,8 @@ msgid "Image Size"
 msgstr "Bildgröße"
 
 #: src/compose-dialog.vala:2329
-msgid "Paste as Plain Text"
-msgstr "Als einfachen Text einfügen"
+msgid "Paste and Match Style"
+msgstr "Einfügen und Formatierung anpassen"
 
 #: src/compose-dialog.vala:2335
 msgid "Ignore Spelling"
