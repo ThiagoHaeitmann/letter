@@ -612,6 +612,23 @@ msgstr ""
 msgid "Update Folder"
 msgstr ""
 
+#: src/window.vala:7820
+msgid "Update “%s” from server?"
+msgstr ""
+
+#: src/window.vala:7821
+msgid "Letter will try to fully align this folder’s local cache with the server. On large folders this can take up to five minutes. Sending stays in the Outbox and messages without a cached body wait until it finishes. Only the time limit can stop this update."
+msgstr ""
+
+msgid "Updating “%s” from server…"
+msgstr ""
+
+msgid "Update in progress…"
+msgstr ""
+
+msgid "A folder update is already in progress."
+msgstr ""
+
 #: src/window.vala:7397 src/window.vala:7471
 msgid "Empty"
 msgstr ""

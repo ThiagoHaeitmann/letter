@@ -633,6 +633,23 @@ msgstr "Alle als ungelesen markieren"
 msgid "Update Folder"
 msgstr "Ordner aktualisieren"
 
+#: src/window.vala:7820
+msgid "Update “%s” from server?"
+msgstr "„%s“ vom Server aktualisieren?"
+
+#: src/window.vala:7821
+msgid "Letter will try to fully align this folder’s local cache with the server. On large folders this can take up to five minutes. Sending stays in the Outbox and messages without a cached body wait until it finishes. Only the time limit can stop this update."
+msgstr "Letter versucht, den lokalen Cache dieses Ordners vollständig mit dem Server abzugleichen. Bei großen Ordnern kann das bis zu fünf Minuten dauern. Senden bleibt im Postausgang; Nachrichten ohne zwischengespeicherten Inhalt warten. Nur das Zeitlimit kann diese Aktualisierung beenden."
+
+msgid "Updating “%s” from server…"
+msgstr "„%s“ wird vom Server aktualisiert…"
+
+msgid "Update in progress…"
+msgstr "Aktualisierung läuft…"
+
+msgid "A folder update is already in progress."
+msgstr "Es läuft bereits eine Ordneraktualisierung."
+
 #: src/window.vala:7397 src/window.vala:7471
 msgid "Empty"
 msgstr "Leeren"

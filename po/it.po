@@ -628,6 +628,23 @@ msgstr "Segna tutte come non lette"
 msgid "Update Folder"
 msgstr "Aggiorna cartella"
 
+#: src/window.vala:7820
+msgid "Update “%s” from server?"
+msgstr "Aggiornare “%s” dal server?"
+
+#: src/window.vala:7821
+msgid "Letter will try to fully align this folder’s local cache with the server. On large folders this can take up to five minutes. Sending stays in the Outbox and messages without a cached body wait until it finishes. Only the time limit can stop this update."
+msgstr "Letter proverà ad allineare completamente la cache locale di questa cartella con il server. Su cartelle grandi può richiedere fino a cinque minuti. Gli invii restano in Posta in uscita e i messaggi senza corpo in cache attendono la fine. Solo il limite di tempo può interrompere questo aggiornamento."
+
+msgid "Updating “%s” from server…"
+msgstr "Aggiornamento di “%s” dal server…"
+
+msgid "Update in progress…"
+msgstr "Aggiornamento in corso…"
+
+msgid "A folder update is already in progress."
+msgstr "È già in corso un aggiornamento di una cartella."
+
 #: src/window.vala:7397 src/window.vala:7471
 msgid "Empty"
 msgstr "Svuota"

@@ -19,19 +19,25 @@ refactors unless they affect behaviour.
 
 ## [Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.3...HEAD)
 
+
+
 ### Changed
 
-- Archive / Sent no longer chase Microsoft 365 Online Archive count drift with
-  background `refresh_info`. One silent Graph refresh runs once at startup.
-  Context menu **Update Folder** refreshes one folder on demand.
+- Large Archive / Sent folders no longer keep retrying endless server refreshes  
+when Microsoft 365 Online Archive makes message counts drift.
+- Context menu **Update Folder** runs a thorough server high priority align for that folder. 
+
+
 
 ### Fixed
 
 - Compose / Sent recipient chips no longer glue bare addresses into the next
-  `Name <email>` entry when the To list mixes plain emails and display names
-  (also repairs “Send again” and older mangled Sent headers when possible).
+`Name <email>` entry when the To list mixes plain emails and display names
+(also repairs “Send again” and older mangled Sent headers when possible).
 - Compose recipient field no longer storms the GDK frame clock with continuous
-  layout requests while typing addresses (WrapBox + expanding entry).
+layout requests while typing addresses (WrapBox + expanding entry).
+
+
 
 ## [1.0.0-rc.3](https://github.com/stalvatero/letter/compare/v1.0.0-rc.2...v1.0.0-rc.3) - 2026-09-14
 
@@ -40,63 +46,69 @@ refactors unless they affect behaviour.
 ### Added
 
 - Soft archive / move / copy / flag changes are written to an on-disk mutation
-  registry. Pending work stays durable across crash, offline use, and restarts
-  instead of living only in RAM.
+registry. Pending work stays durable across crash, offline use, and restarts
+instead of living only in RAM.
 - Compose autosave every 2 minutes into the account **Drafts** folder (local
-  Camel store; server upload follows the normal sync interval). Toast once per
-  compose window.
+Camel store; server upload follows the normal sync interval). Toast once per
+compose window.
 - Virtual **Outbox**: Send writes the message to disk first, then delivers on
-  an isolated retry pump (badge, Edit / Send Now / Cancel Send). Sending no
-  longer waits behind Archive body sync.
+an isolated retry pump (badge, Edit / Send Now / Cancel Send). Sending no
+longer waits behind Archive body sync.
+
+
 
 ### Changed
 
 - Opening a folder is cache-first (disk/Camel local); server header sync runs
-  on F5, the mail-check timer, scout, or when the local list is clearly
-  incomplete while online. Status “Updating…” stays for the open folder / F5.
+on F5, the mail-check timer, scout, or when the local list is clearly
+incomplete while online. Status “Updating…” stays for the open folder / F5.
 - Large folders (Archive, Sent, custom bulk): scout uses short, widening
-  budgets instead of a full 90s `refresh_info` every cycle, with backoff after
-  a failed full attempt. Sent/Drafts also get a periodic tip refresh.
+budgets instead of a full 90s `refresh_info` every cycle, with backoff after
+a failed full attempt. Sent/Drafts also get a periodic tip refresh.
 - Empty Trash / Junk and permanent deletes use Camel `synchronize` then
-  `expunge` where needed. Microsoft 365 repairs missing Trash/Junk folder type
-  flags and hard-deletes Junk via Trash.
+`expunge` where needed. Microsoft 365 repairs missing Trash/Junk folder type
+flags and hard-deletes Junk via Trash.
 - Archive / delete / flag apply in the UI immediately; Graph push waits for the
-  sync timer, F5, startup, or a timed quit flush so Send stays responsive.
+sync timer, F5, startup, or a timed quit flush so Send stays responsive.
 - Recipient chips require a real `user@domain` address. Outbox surfaces the
-  first send failure immediately.
+first send failure immediately.
 - Inline compose images (insert, drag-drop, clipboard paste) are sent as
-  `multipart/related` CID parts instead of raw `data:` URIs.
+`multipart/related` CID parts instead of raw `data:` URIs.
 - Flatpak ships a minimal Evolution + `evolution-ews` stack so Microsoft 365
-  Graph mail works in the sandbox (bundle is larger). Host `evolution-ews`
-  remains useful for Calendar/Contacts. UI translations ship inside the
-  bundle; new Flatpak / first-sync strings translated for Italian and German.
+Graph mail works in the sandbox (bundle is larger). Host `evolution-ews`
+remains useful for Calendar/Contacts. UI translations ship inside the
+bundle; new Flatpak / first-sync strings translated for Italian and German.
 - Folder pane shows live activity (Updating… / Sending… / Downloading…). Body
-  prefetch pauses when a send is waiting. Hung Graph folder refreshes are
-  time-bounded so they cannot block reading forever.
+prefetch pauses when a send is waiting. Hung Graph folder refreshes are
+time-bounded so they cannot block reading forever.
+
+
 
 ### Fixed
 
 - Opening a folder no longer forces a server refresh on every click (that broke
-  offline browsing and cancelled work when switching folders).
+offline browsing and cancelled work when switching folders).
 - Startup no longer skips the first Inbox sync when opening a folder preempts
-  the folder-tree job.
+the folder-tree job.
 - Microsoft 365 Archive moves no longer hang for minutes on one message;
-  Letter freezes the Camel folders around the transfer so moves finish in
-  seconds and can run in bulk.
+Letter freezes the Camel folders around the transfer so moves finish in
+seconds and can run in bulk.
 - Microsoft 365 Empty Junk and permanent deletes from Trash no longer come
-  back after sync.
+back after sync.
 - Large Archive (and similar) folders no longer stay stuck on a stale local
-  header list when Camel already has many more UIDs; opening the folder
-  rebuilds the list.
+header list when Camel already has many more UIDs; opening the folder
+rebuilds the list.
 - Sending could stick on “Sending…” forever while Archive body download held
-  Camel; send can now finish even when background work was stuck.
+Camel; send can now finish even when background work was stuck.
 - Preferences “Download message bodies” applies to every folder, not only
-  Inbox.
+Inbox.
 - Flatpak Dependencies page correctly detects host `evolution-ews` and Sushi;
-  Online Accounts / Calendar / Contacts menu actions open the host apps over
-  D-Bus.
+Online Accounts / Calendar / Contacts menu actions open the host apps over
+D-Bus.
 - Folders with unread/total hints but no local headers yet show an “aligning
-  local cache” wait state instead of looking empty during first sync.
+local cache” wait state instead of looking empty during first sync.
+
+
 
 ## [1.0.0-rc.2](https://github.com/stalvatero/letter/compare/v1.0.0-rc.1...v1.0.0-rc.2) - 2026-09-09
 

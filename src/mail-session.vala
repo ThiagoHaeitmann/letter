@@ -1057,6 +1057,8 @@ public class Mail.MailSession : Camel.Session {
     public const uint REFRESH_INFO_BRIEF = 15;
     public const uint REFRESH_INFO_NORMAL = 45;
     public const uint REFRESH_INFO_FULL = 90;
+    /* Explicit Update Folder — only wall-clock ends it (matches sync interval). */
+    public const uint REFRESH_INFO_FORCE = 300;
 
     private async void refresh_folder_info (
         Camel.Folder camel_folder,
