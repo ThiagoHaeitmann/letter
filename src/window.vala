@@ -6530,6 +6530,35 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.message_reader.print (this);
     }
 
+    private async void save_message_as_eml (Message message) {
+        if (message.is_placeholder || is_outbox_message (message))
+            return;
+        var account = this.selected_account;
+        var folder = folder_for_message (message);
+        if (this.mail_session == null || account == null || folder == null || folder.is_virtual_view) {
+            show_toast (_("Could not save this message."));
+            return;
+        }
+
+        File? dest = null;
+        try {
+            dest = yield Utils.prompt_save_eml (this, message.subject);
+        } catch (Error e) {
+            if (!(e is IOError.CANCELLED))
+                show_toast (e.message);
+            return;
+        }
+        if (dest == null)
+            return;
+
+        try {
+            yield this.mail_session.export_message_eml (account, folder, message.uid, dest);
+            show_toast (_("Message saved."));
+        } catch (Error e) {
+            show_toast (e.message);
+        }
+    }
+
     private async void open_message_window (Message message) {
         var app = get_application () as Application;
         var account = this.selected_account;
@@ -8230,6 +8259,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         add_ctx_action (group, "mark-important", is_gmail_account () && !outgoing && !outbox && !message.is_placeholder
             && find_folder_kind (FolderKind.IMPORTANT) != null, () => toggle_message_important (message));
         add_ctx_action (group, "print", !outbox, () => print_open_message.begin ());
+        add_ctx_action (group, "save-eml", !outbox && !message.is_placeholder, () => {
+            save_message_as_eml.begin (message);
+        });
         add_ctx_action (group, "delete", true, () => on_delete ());
 
         var menu = new Menu ();
@@ -8274,6 +8306,8 @@ public class Mail.Window : Adw.ApplicationWindow {
                 && find_folder_kind (FolderKind.IMPORTANT) != null)
                 flags.append (message.important ? _("Not Important") : _("Mark as Important"), "ctx.mark-important");
             flags.append (_("Print"), "ctx.print");
+            if (!message.is_placeholder)
+                flags.append (_("Save as EML…"), "ctx.save-eml");
             if (flags.get_n_items () > 0)
                 menu.append_section (null, flags);
         }

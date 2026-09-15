@@ -331,6 +331,47 @@ namespace Mail.Utils {
         remember_download_folder (file);
     }
 
+    public static string eml_filename_for (string? subject) {
+        var name = (subject ?? "").strip ();
+        if (name.length == 0 || name == _("(No subject)"))
+            name = _("Message");
+        name = name.replace ("/", "-").replace ("\\", "-").replace (":", "-");
+        name = name.replace ("\n", " ").replace ("\r", " ").replace ("\t", " ");
+        while (name.contains ("  "))
+            name = name.replace ("  ", " ");
+        name = name.strip ();
+        if (name.length > 120)
+            name = name.substring (0, 120).strip ();
+        if (name.length == 0)
+            name = _("Message");
+        if (!name.down ().has_suffix (".eml"))
+            name += ".eml";
+        return name;
+    }
+
+    public static async File? prompt_save_eml (Gtk.Window? parent, string? subject) throws Error {
+        var dialog = new Gtk.FileDialog () {
+            title = _("Save as EML"),
+            initial_name = eml_filename_for (subject),
+            initial_folder = download_folder (),
+        };
+        var filters = new ListStore (typeof (Gtk.FileFilter));
+        var eml = new Gtk.FileFilter () {
+            name = _("Email Message"),
+        };
+        eml.add_mime_type ("message/rfc822");
+        eml.add_mime_type ("application/eml");
+        eml.add_pattern ("*.eml");
+        filters.append (eml);
+        dialog.filters = filters;
+        dialog.default_filter = eml;
+        var file = yield dialog.save (parent, null);
+        if (file == null)
+            return null;
+        remember_download_folder (file);
+        return file;
+    }
+
     public static async void save_attachments (GenericArray<Attachment> attachments, Gtk.Window? parent) throws Error {
         if (attachments.length == 1) {
             yield save_attachment (attachments[0], parent);

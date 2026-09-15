@@ -123,6 +123,10 @@ public class Mail.InvitationBar : Gtk.Box {
         set_busy (false);
     }
 
+    public void set_actions_visible (bool visible) {
+        this.buttons.visible = visible;
+    }
+
     private static string heading_for (Invitation invitation) {
         switch (invitation.kind) {
         case InvitationKind.CANCEL:

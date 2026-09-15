@@ -23,6 +23,9 @@ refactors unless they affect behaviour.
 
 ### Added
 
+- Open `.eml` / `message/rfc822` files in a read-only viewer (no reply, forward,
+  or other actions). Letter can register as a handler for those MIME types.
+- Context menu **Save as EML…** on a single message exports it to a file you choose.
 - Compose context menu **Paste and Match Style** (also Ctrl+Shift+V) pastes
 clipboard text using the font and size you are already typing with.
 - Preferences **Aggregate sound** (on by default): one beep for all new mail in

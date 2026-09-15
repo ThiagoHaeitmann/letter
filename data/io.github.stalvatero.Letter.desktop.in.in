@@ -2,7 +2,7 @@
 # Translators: the application name shown in the app grid, window title and tooltips
 Name=@app_name@
 Comment=Read and send mail
-Exec=@bindir@/letter
+Exec=@bindir@/letter %U
 # Translators: Do not translate
 Icon=@icon@
 Terminal=false
@@ -12,7 +12,7 @@ Categories=GNOME;GTK;Network;Email;
 Keywords=email;mail;imap;google;outlook;exchange;
 StartupNotify=true
 DBusActivatable=false
-MimeType=x-scheme-handler/mailto;
+MimeType=x-scheme-handler/mailto;message/rfc822;application/eml;
 X-GNOME-UsesNotifications=true
 Actions=new-message;
 

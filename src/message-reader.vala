@@ -245,6 +245,10 @@ public class Mail.MessageReader : Gtk.Box {
         this.header_actions.visible = show && this.current != null;
     }
 
+    public void set_show_invitation_actions (bool show) {
+        this.invitation_bar.set_actions_visible (show);
+    }
+
     public void set_bookmarked (bool bookmarked) {
         this.header_actions.set_bookmarked (bookmarked);
     }

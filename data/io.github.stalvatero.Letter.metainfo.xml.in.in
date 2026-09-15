@@ -22,6 +22,10 @@
     </p>
   </description>
   <launchable type="desktop-id">@app_id@.desktop</launchable>
+  <provides>
+    <mediatype>message/rfc822</mediatype>
+    <mediatype>application/eml</mediatype>
+  </provides>
   <url type="homepage">https://github.com/stalvatero/letter</url>
   <url type="bugtracker">https://github.com/stalvatero/letter/issues</url>
   <translation type="gettext">letter</translation>

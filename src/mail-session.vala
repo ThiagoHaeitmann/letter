@@ -2005,6 +2005,55 @@ public class Mail.MailSession : Camel.Session {
         return fetched;
     }
 
+    public async void export_message_eml (
+        Account account,
+        Folder folder,
+        string uid,
+        File dest,
+        Cancellable? cancellable = null
+    ) throws Error {
+        var camel_folder = yield open_camel_folder (account, folder, cancellable);
+        var mime = message_from_local_cache (camel_folder, uid);
+        if (mime == null) {
+            try {
+                mime = yield fetch_camel_message (camel_folder, uid, Priority.DEFAULT, cancellable);
+            } catch (Error e) {
+                mime = message_from_local_cache (camel_folder, uid);
+                if (mime == null) {
+                    if (is_missing_on_server (e)) {
+                        throw new IOError.NOT_FOUND (
+                            _("This message is still syncing with the server. Try again in a moment.")
+                        );
+                    }
+                    throw e;
+                }
+            }
+        }
+        if (mime == null) {
+            throw new IOError.NOT_FOUND (
+                _("Message could not be opened.")
+            );
+        }
+
+        var stream = yield dest.replace_async (
+            null,
+            false,
+            FileCreateFlags.REPLACE_DESTINATION,
+            Priority.DEFAULT,
+            cancellable
+        );
+        try {
+            yield mime.write_to_output_stream (stream, Priority.DEFAULT, cancellable);
+            yield stream.close_async (Priority.DEFAULT, cancellable);
+        } catch (Error e) {
+            try {
+                yield stream.close_async (Priority.DEFAULT, null);
+            } catch (Error ignore) {
+            }
+            throw e;
+        }
+    }
+
     public void queue_mark_seen (Account account, Folder folder, string uid) {
         set_message_seen.begin (account, folder, uid, true, null, (obj, res) => {
             try {

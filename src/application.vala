@@ -33,7 +33,7 @@ public class Mail.Application : Adw.Application {
         Object (
             application_id: Config.APP_ID,
             resource_base_path: Config.RESOURCE_PATH,
-            flags: ApplicationFlags.HANDLES_COMMAND_LINE
+            flags: ApplicationFlags.HANDLES_OPEN | ApplicationFlags.HANDLES_COMMAND_LINE
         );
     }
 
@@ -237,10 +237,56 @@ public class Mail.Application : Adw.Application {
             new_message = value != null && value.get_boolean ();
         }
 
-        activate ();
+        var files = new GenericArray<File> ();
+        var argv = command_line.get_arguments ();
+        for (int i = 1; i < argv.length; i++) {
+            var arg = argv[i];
+            if (arg.has_prefix ("-"))
+                continue;
+            files.add (command_line.create_file_for_arg (arg));
+        }
+
+        if (new_message || files.length == 0)
+            activate ();
         if (new_message)
             on_new_message ();
+
+        for (int i = 0; i < files.length; i++)
+            open_eml_file.begin (files[i]);
         return 0;
+    }
+
+    public override void open (File[] files, string hint) {
+        foreach (var file in files)
+            open_eml_file.begin (file);
+    }
+
+    private async void open_eml_file (File file) {
+        hold ();
+        try {
+            if (!EmlViewerWindow.looks_like_eml (file)) {
+                warning ("Ignoring non-message file: %s", file.get_uri ());
+                return;
+            }
+            var mail = yield EmlViewerWindow.load_file (file);
+            var viewer = new EmlViewerWindow (this, mail, file.get_basename ());
+            viewer.present ();
+        } catch (Error e) {
+            critical ("Failed to open %s: %s", file.get_uri (), e.message);
+            var parent = get_active_window ();
+            if (parent != null) {
+                var dialog = new Adw.AlertDialog (
+                    _("Could not open this message file."),
+                    e.message
+                );
+                dialog.add_response ("ok", _("OK"));
+                dialog.present (parent);
+            } else {
+                show_mail_toast (_("Could not open this message file."));
+            }
+        } finally {
+            release ();
+        }
     }
 
     private void on_new_message () {

@@ -38,6 +38,7 @@ mail_sources = files(
   'conversation.vala',
   'message-reader.vala',
   'message-window.vala',
+  'eml-viewer.vala',
   'attachment-chip.vala',
   'compose-dialog.vala',
   'outbox-store.vala',
