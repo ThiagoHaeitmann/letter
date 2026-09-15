@@ -25,6 +25,8 @@ refactors unless they affect behaviour.
 
 - Compose context menu **Paste and Match Style** (also Ctrl+Shift+V) pastes
 clipboard text using the font and size you are already typing with.
+- Preferences **Aggregate sound** (on by default): one beep for all new mail in
+a check cycle instead of a beep per message.
 
 
 

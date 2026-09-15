@@ -119,6 +119,11 @@
       <summary>Notification sound</summary>
       <description>Freedesktop sound name, a file URI, or none to stay silent when new mail arrives.</description>
     </key>
+    <key name="notification-sound-aggregate" type="b">
+      <default>true</default>
+      <summary>Aggregate notification sound</summary>
+      <description>When enabled, play only one sound for all new mail found in the same check cycle. When disabled, play a sound for every new message.</description>
+    </key>
     <key name="last-download-folder" type="s">
       <default>''</default>
       <summary>Last download folder</summary>

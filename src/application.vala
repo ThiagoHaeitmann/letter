@@ -115,6 +115,7 @@ public class Mail.Application : Adw.Application {
             "conversation-view",
             "notifications",
             "notification-sound",
+            "notification-sound-aggregate",
             "last-download-folder",
             "compose-signatures",
             "compose-signature-name",

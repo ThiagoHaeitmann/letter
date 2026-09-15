@@ -1713,6 +1713,12 @@ msgstr ""
 msgid "Notification sound"
 msgstr ""
 
+msgid "Aggregate sound"
+msgstr ""
+
+msgid "On: one sound for all new mail in a check cycle. Off: a sound for every new message."
+msgstr ""
+
 #: src/preferences-dialog.vala:136
 msgid "Default"
 msgstr ""

@@ -1768,6 +1768,12 @@ msgstr "Desktop-Benachrichtigungen für neue E-Mails."
 msgid "Notification sound"
 msgstr "Benachrichtigungston"
 
+msgid "Aggregate sound"
+msgstr "Sammelton"
+
+msgid "On: one sound for all new mail in a check cycle. Off: a sound for every new message."
+msgstr "Ein: ein Ton für die gesamte neue Post in einem Prüfzyklus. Aus: ein Ton für jede neue E-Mail."
+
 #: src/preferences-dialog.vala:136
 msgid "Default"
 msgstr "Standard"

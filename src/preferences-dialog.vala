@@ -4,6 +4,7 @@ public class Mail.PreferencesDialog : Adw.PreferencesDialog {
     private Adw.PreferencesGroup cache_group;
     private Adw.ActionRow total_row;
     private Adw.ComboRow sound_row;
+    private Adw.SwitchRow aggregate_sound_row;
     private Adw.ComboRow interval_row;
     private Adw.ComboRow cache_days_row;
     private GenericArray<Gtk.ToggleButton> section_chips = new GenericArray<Gtk.ToggleButton> ();
@@ -126,6 +127,7 @@ public class Mail.PreferencesDialog : Adw.PreferencesDialog {
         notify_row.notify["active"].connect (() => {
             this.settings.set_boolean ("notifications", notify_row.active);
             this.sound_row.sensitive = notify_row.active;
+            this.aggregate_sound_row.sensitive = notify_row.active;
         });
         notifications.add (notify_row);
 
@@ -155,6 +157,17 @@ public class Mail.PreferencesDialog : Adw.PreferencesDialog {
             on_sound_selected.begin ();
         });
         notifications.add (this.sound_row);
+
+        this.aggregate_sound_row = new Adw.SwitchRow () {
+            title = _("Aggregate sound"),
+            subtitle = _("On: one sound for all new mail in a check cycle. Off: a sound for every new message."),
+            active = this.settings.get_boolean ("notification-sound-aggregate"),
+            sensitive = notify_row.active,
+        };
+        this.aggregate_sound_row.notify["active"].connect (() => {
+            this.settings.set_boolean ("notification-sound-aggregate", this.aggregate_sound_row.active);
+        });
+        notifications.add (this.aggregate_sound_row);
 
         var sync = new Adw.PreferencesGroup () {
             title = _("Synchronization"),

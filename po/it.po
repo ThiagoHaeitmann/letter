@@ -1756,6 +1756,12 @@ msgstr "Avvisi desktop per la posta nuova."
 msgid "Notification sound"
 msgstr "Suono di notifica"
 
+msgid "Aggregate sound"
+msgstr "Suono aggregato"
+
+msgid "On: one sound for all new mail in a check cycle. Off: a sound for every new message."
+msgstr "Attiva per ricevere una notifica sonora unica per tutta la nuova posta in arrivo in un ciclo di controllo. Disattiva per ricevere un suono per ogni nuova e-mail."
+
 #: src/preferences-dialog.vala:136
 msgid "Default"
 msgstr "Predefinito"

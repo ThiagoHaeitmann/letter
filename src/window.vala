@@ -134,6 +134,8 @@ public class Mail.Window : Adw.ApplicationWindow {
     private bool folder_tree_needs_refresh;
     private bool continue_startup_after_tree;
     private HashTable<string, uint8> notified_uids;
+    /* Aggregate sound: at most one beep per burst / mail-check cycle. */
+    private int64 last_notification_sound_at;
     private GenericArray<MailSyncJob> sync_jobs;
     private bool restoring_selection;
     private string? pending_select_uid;
@@ -4837,6 +4839,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         uint shown = 0;
         uint extra = 0;
         const uint LIMIT = 5;
+        var aggregate = this.settings.get_boolean ("notification-sound-aggregate");
         for (uint i = 0; i < fresh.length; i++) {
             var message = fresh[i];
             this.notified_uids.set (hide_key (account, folder, message.uid), 1);
@@ -4844,7 +4847,8 @@ public class Mail.Window : Adw.ApplicationWindow {
                 extra++;
                 continue;
             }
-            send_mail_notification (app, account, folder, message, shown == 0);
+            var sound = aggregate ? take_aggregated_notification_sound () : true;
+            send_mail_notification (app, account, folder, message, sound);
             shown++;
         }
         Utils.sync_log ("notify “%s”: %u shown, %u extra".printf (folder.name, shown, extra));
@@ -4856,6 +4860,23 @@ public class Mail.Window : Adw.ApplicationWindow {
             account.source_uid ?? account.uid,
             folder.full_name
         ));
+    }
+
+    /* One sound for a whole arrival burst (mail-check / Camel watch). Further
+     * alerts in this window stay silent; the next mail-check resets the slot. */
+    private const int64 NOTIFICATION_SOUND_AGGREGATE_WINDOW = 45 * TimeSpan.SECOND;
+
+    private bool take_aggregated_notification_sound () {
+        var now = Utils.sync_tick ();
+        if (this.last_notification_sound_at > 0
+            && (now - this.last_notification_sound_at) < NOTIFICATION_SOUND_AGGREGATE_WINDOW)
+            return false;
+        this.last_notification_sound_at = now;
+        return true;
+    }
+
+    private void reset_notification_sound_cycle () {
+        this.last_notification_sound_at = 0;
     }
 
     private void send_mail_notification (Application app, Account account, Folder folder, Message message, bool sound) {
@@ -8820,6 +8841,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (this.mail_session == null || account == null || account.kind == AccountKind.LOCAL || !account.has_mail)
             return;
 
+        reset_notification_sound_cycle ();
         preempt_background_sync (force_tree ? "manual refresh" : "sync timer");
 
         /* Commit toast-pending archives/deletes, then wait until Camel has
