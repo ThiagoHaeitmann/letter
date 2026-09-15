@@ -23,6 +23,8 @@ refactors unless they affect behaviour.
 
 ### Added
 
+- Right-click a To/Cc recipient chip in the message view for **Write to**
+  (new compose) or **Copy Email**.
 - Open `.eml` / `message/rfc822` files in a read-only viewer (no reply, forward,
   or other actions). Letter can register as a handler for those MIME types.
 - Context menu **Save as EML…** on a single message exports it to a file you choose.
@@ -50,6 +52,8 @@ when Microsoft 365 Online Archive makes message counts drift.
 
 ### Fixed
 
+- Typing a recipient address and pressing Space turns it into a chip (or takes
+  the autocomplete suggestion); display names without `@` still accept spaces.
 - Compose keeps a single Drafts copy per message: later autosaves replace the
 previous revision instead of leaving duplicates, and closing after further
 edits asks to save those changes again. Opening Drafts also rebuilds from

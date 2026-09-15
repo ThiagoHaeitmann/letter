@@ -281,6 +281,7 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.message_reader.invitation_respond.connect ((invitation, status) => {
             respond_invitation.begin (invitation, status);
         });
+        this.message_reader.compose_to.connect (on_compose_to);
         this.thread_list = new Gtk.ListBox () {
             selection_mode = Gtk.SelectionMode.MULTIPLE,
             hexpand = true,
@@ -6064,6 +6065,35 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
 
         var compose = new ComposeWindow (app, this.mail_session, app.accounts, this.selected_account);
+        compose.present ();
+    }
+
+    private void on_compose_to (Recipient recipient) {
+        if (this.mail_session == null) {
+            this.toast_overlay.add_toast (new Adw.Toast (_("Evolution Data Server is unavailable.")) {
+                timeout = 4,
+            });
+            return;
+        }
+
+        var app = get_application () as Application;
+        if (app == null)
+            return;
+
+        if (Utils.sendable_account_count (app.accounts) == 0) {
+            this.toast_overlay.add_toast (new Adw.Toast (_("No account is configured to send mail.")) {
+                timeout = 4,
+            });
+            return;
+        }
+
+        var compose = new ComposeWindow (
+            app,
+            this.mail_session,
+            app.accounts,
+            this.selected_account,
+            Utils.format_recipient (recipient)
+        );
         compose.present ();
     }
 

@@ -2458,6 +2458,15 @@ msgid "Try a different name or email address."
 msgstr ""
 "Versuchen Sie es mit einem anderen Namen oder einer anderen E-Mail-Adresse."
 
+msgid "Write to"
+msgstr "Schreiben an"
+
+msgid "Copy Email"
+msgstr "E-Mail kopieren"
+
+msgid "Address copied"
+msgstr "Adresse kopiert"
+
 #, c-format
 #~ msgid "Synchronizing with the server (%u)…"
 #~ msgstr "Synchronisierung mit dem Server (%u) …"

@@ -2331,3 +2331,15 @@ msgstr ""
 #: src/contact-picker.vala:90
 msgid "Try a different name or email address."
 msgstr ""
+
+#: src/message-reader.vala
+msgid "Write to"
+msgstr ""
+
+#: src/message-reader.vala
+msgid "Copy Email"
+msgstr ""
+
+#: src/message-reader.vala
+msgid "Address copied"
+msgstr ""

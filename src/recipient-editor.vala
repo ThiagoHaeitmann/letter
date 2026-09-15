@@ -468,6 +468,34 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
             commit_input ();
     }
 
+    /* Space cannot appear in a mailbox address. With a suggestion open, or when
+     * the field already holds a sendable address, treat Space like Enter so the
+     * chip is created. Display names without '@' still accept spaces. */
+    private bool try_commit_on_space () {
+        if (suggest_is_open ()) {
+            apply_selected_suggest ();
+            return true;
+        }
+
+        var raw = this.input.text.strip ();
+        if (raw.length == 0 || !raw.contains ("@"))
+            return false;
+
+        var parsed = Utils.parse_recipient_list (raw);
+        var sendable = false;
+        for (uint i = 0; i < parsed.length; i++) {
+            if (Utils.normalize_sendable_recipient (parsed[i]) != null) {
+                sendable = true;
+                break;
+            }
+        }
+        if (!sendable)
+            return false;
+
+        commit_input ();
+        return true;
+    }
+
     private void commit_input () {
         var raw = this.input.text.strip ();
         if (raw.length == 0)
@@ -858,6 +886,11 @@ public class Mail.RecipientEditor : Adw.PreferencesRow {
         }
         if ((keyval == Gdk.Key.Return || keyval == Gdk.Key.KP_Enter) && suggest_is_open ()) {
             apply_selected_suggest ();
+            return true;
+        }
+        if ((keyval == Gdk.Key.space || keyval == Gdk.Key.KP_Space)
+            && (mods & Gtk.accelerator_get_default_mod_mask ()) == 0
+            && try_commit_on_space ()) {
             return true;
         }
         if (keyval == Gdk.Key.Tab && suggest_is_open () && (mods & Gdk.ModifierType.SHIFT_MASK) == 0) {

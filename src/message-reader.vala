@@ -1,5 +1,6 @@
 public class Mail.MessageReader : Gtk.Box {
     public signal void invitation_respond (Invitation invitation, InvitationStatus status);
+    public signal void compose_to (Recipient recipient);
 
     private const double ZOOM_MIN = 0.5;
     private const double ZOOM_MAX = 3.0;
@@ -117,8 +118,10 @@ public class Mail.MessageReader : Gtk.Box {
         meta_block.append (meta);
 
         this.to_row = new RecipientRow (_("To:"));
+        this.to_row.write_to.connect ((recipient) => compose_to (recipient));
         meta_block.append (this.to_row);
         this.cc_row = new RecipientRow (_("Cc:"));
+        this.cc_row.write_to.connect ((recipient) => compose_to (recipient));
         meta_block.append (this.cc_row);
 
         this.attachments_box = new Adw.WrapBox () {
@@ -780,6 +783,8 @@ html { color-scheme: only light; }
 }
 
 private class Mail.RecipientRow : Gtk.Box {
+    public signal void write_to (Recipient recipient);
+
     private RecipientChips chips;
 
     public RecipientRow (string caption_text) {
@@ -797,6 +802,7 @@ private class Mail.RecipientRow : Gtk.Box {
         append (caption);
 
         this.chips = new RecipientChips ();
+        this.chips.write_to.connect ((recipient) => write_to (recipient));
         append (this.chips);
     }
 
@@ -809,6 +815,8 @@ private class Mail.RecipientRow : Gtk.Box {
 }
 
 private class Mail.RecipientChips : Gtk.Widget {
+    public signal void write_to (Recipient recipient);
+
     private const int MAX_LINES = 2;
     private const int SPACING = 6;
 
@@ -816,6 +824,9 @@ private class Mail.RecipientChips : Gtk.Widget {
     private Gtk.Button more_button;
     private Gtk.Label more_label;
     private bool expanded;
+    private Gtk.PopoverMenu? chip_menu;
+    private Gtk.Widget? menu_chip;
+    private string? menu_chip_tooltip;
 
     static construct {
         set_css_name ("recipient-chips");
@@ -840,6 +851,7 @@ private class Mail.RecipientChips : Gtk.Widget {
     }
 
     public override void dispose () {
+        dismiss_chip_menu ();
         for (uint i = 0; i < this.chips.length; i++) {
             if (this.chips[i].get_parent () == this)
                 this.chips[i].unparent ();
@@ -851,6 +863,7 @@ private class Mail.RecipientChips : Gtk.Widget {
     }
 
     public void bind (GenericArray<Recipient>? recipients) {
+        dismiss_chip_menu ();
         this.expanded = false;
         for (uint i = 0; i < this.chips.length; i++)
             this.chips[i].unparent ();
@@ -872,7 +885,7 @@ private class Mail.RecipientChips : Gtk.Widget {
         queue_resize ();
     }
 
-    private static Gtk.Widget make_chip (Recipient recipient) {
+    private Gtk.Widget make_chip (Recipient recipient) {
         var label = new Gtk.Label (recipient.chip_label) {
             ellipsize = Pango.EllipsizeMode.END,
             max_width_chars = 22,
@@ -885,7 +898,108 @@ private class Mail.RecipientChips : Gtk.Widget {
         };
         box.add_css_class ("recipient-chip");
         box.append (label);
+
+        var click = new Gtk.GestureClick () {
+            button = Gdk.BUTTON_SECONDARY,
+        };
+        click.pressed.connect ((n_press, x, y) => {
+            popup_chip_menu (box, recipient, x, y);
+            click.set_state (Gtk.EventSequenceState.CLAIMED);
+        });
+        box.add_controller (click);
         return box;
+    }
+
+    private void popup_chip_menu (Gtk.Widget chip, Recipient recipient, double x, double y) {
+        dismiss_chip_menu ();
+
+        /* Hide the hover tooltip so it does not sit on top of the menu. */
+        this.menu_chip = chip;
+        this.menu_chip_tooltip = chip.tooltip_text;
+        chip.set_has_tooltip (false);
+
+        var email = Utils.sanitize_recipient_text (recipient.email);
+        var group = new SimpleActionGroup ();
+
+        var write = new SimpleAction ("write-to", null);
+        write.set_enabled (email.length > 0 && email.contains ("@"));
+        write.activate.connect (() => write_to (recipient));
+        group.add_action (write);
+
+        var copy = new SimpleAction ("copy-email", null);
+        copy.set_enabled (email.length > 0);
+        copy.activate.connect (() => copy_chip_email (chip, email));
+        group.add_action (copy);
+
+        var menu = new Menu ();
+        menu.append (_("Write to"), "chip.write-to");
+        menu.append (_("Copy Email"), "chip.copy-email");
+
+        chip.insert_action_group ("chip", group);
+        var popover = new Gtk.PopoverMenu.from_model (menu) {
+            has_arrow = false,
+            halign = Gtk.Align.START,
+        };
+        popover.set_parent (chip);
+        popover.set_pointing_to (Gdk.Rectangle () {
+            x = (int) x,
+            y = (int) y,
+            width = 1,
+            height = 1,
+        });
+        popover.closed.connect (() => {
+            Idle.add (() => {
+                if (this.chip_menu == popover) {
+                    this.chip_menu = null;
+                    if (popover.parent != null)
+                        popover.unparent ();
+                    chip.insert_action_group ("chip", null);
+                    restore_chip_tooltip ();
+                }
+                return Source.REMOVE;
+            });
+        });
+        this.chip_menu = popover;
+        popover.popup ();
+    }
+
+    private void dismiss_chip_menu () {
+        var popover = this.chip_menu;
+        this.chip_menu = null;
+        restore_chip_tooltip ();
+        if (popover == null)
+            return;
+        popover.popdown ();
+        if (popover.parent != null)
+            popover.unparent ();
+    }
+
+    private void restore_chip_tooltip () {
+        var chip = this.menu_chip;
+        var tip = this.menu_chip_tooltip;
+        this.menu_chip = null;
+        this.menu_chip_tooltip = null;
+        if (chip == null)
+            return;
+        if (tip != null && tip.length > 0)
+            chip.tooltip_text = tip;
+        else
+            chip.set_has_tooltip (false);
+    }
+
+    private void copy_chip_email (Gtk.Widget chip, string email) {
+        chip.get_clipboard ().set_text (email);
+        Gtk.Widget? widget = chip;
+        while (widget != null) {
+            var overlay = widget as Adw.ToastOverlay;
+            if (overlay != null) {
+                overlay.add_toast (new Adw.Toast (_("Address copied")) {
+                    timeout = 2,
+                });
+                return;
+            }
+            widget = widget.parent;
+        }
     }
 
     public override Gtk.SizeRequestMode get_request_mode () {

@@ -2430,6 +2430,15 @@ msgstr "Nessun contatto corrispondente"
 msgid "Try a different name or email address."
 msgstr "Prova un nome o un indirizzo email diverso."
 
+msgid "Write to"
+msgstr "Scrivi a"
+
+msgid "Copy Email"
+msgstr "Copia e-mail"
+
+msgid "Address copied"
+msgstr "Indirizzo copiato"
+
 #, c-format
 #~ msgid "Synchronizing with the server (%u)…"
 #~ msgstr "Sincronizzazione con il server (%u)…"
