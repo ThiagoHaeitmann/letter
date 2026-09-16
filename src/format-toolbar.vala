@@ -117,11 +117,6 @@ public class Mail.FormatToolbar : Gtk.Box {
         return button;
     }
 
-    private Gtk.Button command_button (string icon, string tooltip, string command) {
-        var button = icon_button (icon, tooltip, () => this.view.apply_command (command));
-        return button;
-    }
-
     private Gtk.Button icon_button (string icon, string tooltip, owned VoidFunc action) {
         var button = new Gtk.Button.from_icon_name (icon) {
             valign = Gtk.Align.CENTER,

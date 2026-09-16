@@ -2575,10 +2575,6 @@ public class Mail.ComposeHtmlView : Gtk.Box {
         this.webview.execute_editing_command_with_argument ("InsertText", text);
     }
 
-    public void insert_html (string html) {
-        insert_image_markup (html, null);
-    }
-
     private void insert_image_markup (string html, string? id) {
         if (html.length == 0)
             return;
@@ -2773,25 +2769,6 @@ public class Mail.ComposeHtmlView : Gtk.Box {
     public void apply_size (string size) {
         this.webview.grab_focus ();
         this.webview.execute_editing_command_with_argument ("FontSize", size);
-    }
-
-    public async void set_editor_html (string html) throws Error {
-        yield wait_loaded ();
-        yield this.webview.evaluate_javascript (
-            """
-            (function () {
-                var editor = document.getElementById('editor');
-                if (!editor)
-                    return;
-                var html = %s;
-                editor.innerHTML = html && html.length ? html : '<br>';
-            })();
-            """.printf (js_string (html)),
-            -1,
-            null,
-            null,
-            null
-        );
     }
 
     public async string get_editor_html () throws Error {

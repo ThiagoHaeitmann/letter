@@ -703,21 +703,6 @@ public class Mail.MailSession : Camel.Session {
         watch_camel_folder (account, folder, camel_folder);
     }
 
-    public async GenericArray<Message> sync_headers (Account account, Folder folder) throws Error {
-        var camel_folder = yield open_camel_folder (account, folder, null);
-        watch_camel_folder (account, folder, camel_folder);
-        if (!folder_has_pending_flags (account, folder)) {
-            yield refresh_folder_info (
-                camel_folder,
-                folder.kind == FolderKind.SENT || folder.kind == FolderKind.DRAFTS,
-                null
-            );
-        }
-        var messages = yield collect_messages (account, camel_folder, folder, null);
-        apply_counts_from_messages (folder, messages);
-        return messages;
-    }
-
     public async GenericArray<Message> search_folder (
         Account account,
         Folder folder,
@@ -888,40 +873,6 @@ public class Mail.MailSession : Camel.Session {
         return folder.is_archive_mailbox
             || folder.kind == FolderKind.JUNK
             || folder.kind == FolderKind.TRASH;
-    }
-
-    public static bool folder_is_under (Folder folder, Folder? root) {
-        if (root == null)
-            return false;
-
-        var name = folder.full_name;
-        var base_name = root.full_name;
-        if (name.length == 0 || base_name.length == 0)
-            return false;
-        if (name == base_name)
-            return true;
-
-        return name.has_prefix (base_name + "/")
-            || name.has_prefix (base_name + ".")
-            || name.has_prefix (base_name + "\\");
-    }
-
-    public static bool folder_is_inbox_tree (Folder folder, Folder? inbox) {
-        if (folder.watch_new_mail || folder.kind == FolderKind.INBOX)
-            return true;
-        if (inbox == null)
-            return false;
-
-        var name = folder.full_name;
-        var root = inbox.full_name;
-        if (name.length == 0 || root.length == 0)
-            return false;
-        if (name == root)
-            return true;
-
-        return name.has_prefix (root + "/")
-            || name.has_prefix (root + ".")
-            || name.has_prefix (root + "\\");
     }
 
     /* Camel folder summary size (local SQLite / on-disk UIDs). Does not hit the
@@ -1110,10 +1061,7 @@ public class Mail.MailSession : Camel.Session {
         try {
             var name = camel_folder.get_full_display_name () ?? camel_folder.get_full_name ();
             var t0 = Utils.sync_tick ();
-            /* Do not call prepare_content_refresh(): on Microsoft 365 that
-             * clears the Graph delta cursor and forces a full folder walk
-             * (minutes on Sent/Archive). Outlook keeps the cursor and only
-             * asks for changes. Camel refresh_info already uses delta. */
+            /* Graph: skip prepare_content_refresh — it resets the delta cursor. */
             yield camel_folder.refresh_info (high ? Priority.DEFAULT : Priority.LOW, timed);
             Utils.sync_log ("Camel refresh_info “%s” %s %s".printf (
                 name,
@@ -1149,32 +1097,6 @@ public class Mail.MailSession : Camel.Session {
         } finally {
             leave_camel (high);
         }
-    }
-
-    public async void refresh_folder_counts (
-        Account account,
-        GenericArray<Folder> folders,
-        Cancellable? cancellable = null
-    ) throws Error {
-        if (account.kind == AccountKind.LOCAL)
-            return;
-
-        var store = yield open_store (account, cancellable);
-        var flags = Camel.StoreGetFolderInfoFlags.RECURSIVE
-            | Camel.StoreGetFolderInfoFlags.SUBSCRIBED
-            | Camel.StoreGetFolderInfoFlags.NO_VIRTUAL
-            | Camel.StoreGetFolderInfoFlags.REFRESH;
-        yield enter_camel (false);
-        Camel.FolderInfo? info = null;
-        try {
-            info = yield store.get_folder_info (null, flags, Priority.DEFAULT, cancellable);
-        } finally {
-            leave_camel (false);
-        }
-        var by_name = new HashTable<string, Folder> (str_hash, str_equal);
-        for (uint i = 0; i < folders.length; i++)
-            by_name.set (folders[i].full_name, folders[i]);
-        apply_info_counts (info, by_name);
     }
 
     private async bool query_remote_counts (
@@ -1220,22 +1142,6 @@ public class Mail.MailSession : Camel.Session {
         }
 
         return null;
-    }
-
-    private static void apply_info_counts (Camel.FolderInfo? info, HashTable<string, Folder> by_name) {
-        unowned Camel.FolderInfo? cursor = info;
-        while (cursor != null) {
-            var folder = by_name.get (cursor.full_name);
-            if (folder != null) {
-                if (cursor.unread >= 0)
-                    folder.unread = cursor.unread;
-                if (cursor.total >= 0)
-                    folder.total = cursor.total;
-            }
-
-            apply_info_counts (cursor.child, by_name);
-            cursor = cursor.next;
-        }
     }
 
     private static void apply_counts_from_messages (Folder folder, GenericArray<Message> messages) {
@@ -3896,8 +3802,7 @@ public class Mail.MailSession : Camel.Session {
         }
     }
 
-    /* Prefer Trash/light, then Inbox→Archive (interactive), then bulk
-     * Archive-subtree reshuffles. Drain each job fully in this wave. */
+    /* Prefer light moves, then interactive Archive, then archive-subtree bulk. */
     private int pick_runnable_transfer_job_index () {
         int light = -1;
         int heavy_interactive = -1;
@@ -3924,7 +3829,7 @@ public class Mail.MailSession : Camel.Session {
         return heavy_bulk;
     }
 
-    /* Year folders / Archive children reshuffled into Archivio — deprioritize. */
+    /* Archive-subtree reshuffles — lower priority than Inbox→Archive / Trash. */
     private static bool transfer_job_is_bulk_archive_source (TransferFlushJob job) {
         return job.from.is_archive_mailbox;
     }

@@ -114,8 +114,6 @@ public class Mail.Window : Adw.ApplicationWindow {
     private Message? open_message;
     private Conversation? open_conversation;
     private uint sync_source;
-    private uint idle_bulk_source;
-    private uint idle_bulk_cursor;
     private uint folder_scout_source;
     private uint folder_scout_cursor;
     private bool folder_scout_running;
@@ -852,23 +850,13 @@ public class Mail.Window : Adw.ApplicationWindow {
         return folder.is_virtual_view || folder.is_gmail_namespace;
     }
 
-    /* Bulk storage (Archive/Sent/…) — never auto-walk at startup.
-     * Inbox + its rule-sorted children (watch_new_mail) are the opposite:
-     * they are live incoming mail and must sync like Inbox. */
+    /* Archive/Sent/Junk/Trash (and archive children) — skip auto-walk at startup. */
     private static bool folder_is_bulk_storage (Folder folder) {
         return MailSession.folder_is_heavy (folder)
-            || folder.kind == FolderKind.ARCHIVE
-            || folder.kind == FolderKind.ALL
-            || folder.kind == FolderKind.JUNK
-            || folder.kind == FolderKind.TRASH
             || folder.kind == FolderKind.SENT;
     }
 
-    /* Online Archive moves old mail out of the primary mailbox, so Graph
-     * folder totals on Archive / Sent drift forever. Do not escalate scout
-     * refresh_info to “fix” that deficit. Tip refresh (below) still runs
-     * brief deltas for new UIDs at the head; Update Folder / monthly-style
-     * full align can catch the tail later. */
+    /* Online Archive drifts Graph totals on Archive/Sent — do not chase with scout. */
     private static bool folder_skips_scout_count_chase (Folder folder) {
         return folder.kind == FolderKind.ARCHIVE
             || folder.kind == FolderKind.ALL
@@ -881,16 +869,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         if (folder_is_bulk_storage (folder))
             return false;
         return folder.watch_new_mail || folder.kind == FolderKind.INBOX;
-    }
-
-    private static bool folder_skips_startup_bulk (Folder folder) {
-        if (folder_is_incoming_watch (folder))
-            return false;
-        if (folder_is_bulk_storage (folder))
-            return true;
-        if (folder.total > 400)
-            return true;
-        return false;
     }
 
     private void enqueue_incoming_folder_sync (int header_rank = RANK_BACKGROUND) {
@@ -1081,14 +1059,6 @@ public class Mail.Window : Adw.ApplicationWindow {
             Utils.sync_log ("align “%s” FAILED %s: %s".printf (folder.name, Utils.sync_ms (t0), e.message));
             debug ("Mailbox sync %s: %s", folder.name, e.message);
         }
-    }
-
-    private int background_header_rank (Folder folder) {
-        return RANK_BACKGROUND + mailbox_sync_rank (folder) * 2;
-    }
-
-    private int background_body_rank (Folder folder) {
-        return RANK_BACKGROUND + mailbox_sync_rank (folder) * 2 + 1;
     }
 
     private Folder? sync_job_folder (MailSyncJob job) {
@@ -1428,19 +1398,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         pump_sync.begin ();
     }
 
-    private void schedule_idle_bulk_align (bool from_startup) {
-        stop_idle_bulk_align ();
-        if (from_startup)
-            Utils.sync_log ("idle bulk align: disabled (cache-first model)");
-    }
-
-    private void stop_idle_bulk_align () {
-        if (this.idle_bulk_source == 0)
-            return;
-        Source.remove (this.idle_bulk_source);
-        this.idle_bulk_source = 0;
-    }
-
     /* Debounced background scout: empty header lists with mail on the server,
      * or warm lists whose remote totals/unread drifted (other clients). */
     private void schedule_folder_scout (uint delay_seconds = 5) {
@@ -1718,26 +1675,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         return false;
     }
 
-    private bool sync_has_priority_work () {
-        if (this.sync_pump_running)
-            return true;
-        for (uint i = 0; i < this.sync_jobs.length; i++) {
-            if (this.sync_jobs[i].rank < RANK_IDLE_BULK)
-                return true;
-        }
-        return false;
-    }
-
-    private bool idle_bulk_align_allowed () {
-        if (this.mailbox_bootstrapping || this.tearing_down)
-            return false;
-        if (compose_windows_open ())
-            return false;
-        if (sync_has_priority_work ())
-            return false;
-        return true;
-    }
-
     private bool folder_wants_idle_align (Folder folder) {
         if (folder.is_virtual_view || folder.is_gmail_namespace)
             return false;
@@ -1794,13 +1731,12 @@ public class Mail.Window : Adw.ApplicationWindow {
             return true;
         }
 
-        /* Archive / Sent / ALL: never escalate scout refresh_info to close
-         * Online Archive count drift. Tip refresh handles new head UIDs. */
+        /* Archive / Sent / ALL: tip refresh only — do not chase count drift. */
         if (folder_skips_scout_count_chase (folder))
             return false;
 
         /* Small / incoming-adjacent folders: normal default budget. */
-        if (!folder_is_bulk_storage (folder) && !MailSession.folder_is_heavy (folder)
+        if (!folder_is_bulk_storage (folder)
             && folder.total <= 1500 && !cold) {
             timeout_seconds = MailSession.REFRESH_INFO_NORMAL;
             return true;
@@ -1837,7 +1773,7 @@ public class Mail.Window : Adw.ApplicationWindow {
     private async void note_scout_align_result (Account account, Folder folder, uint used_timeout) {
         if (used_timeout == MailSession.REFRESH_INFO_SKIP)
             return;
-        if (!folder_is_bulk_storage (folder) && !MailSession.folder_is_heavy (folder)
+        if (!folder_is_bulk_storage (folder)
             && folder.total <= 1500)
             return;
 
@@ -2033,51 +1969,6 @@ public class Mail.Window : Adw.ApplicationWindow {
             default:
                 return 6;
         }
-    }
-
-    private GenericArray<Folder> idle_bulk_candidates () {
-        var folders = mailbox_sync_folders ();
-        var list = new GenericArray<Folder> ();
-        for (uint i = 0; i < folders.length; i++) {
-            if (folder_idle_align_safe (folders[i]))
-                list.add (folders[i]);
-        }
-        list.sort ((a, b) => {
-            int rank = idle_bulk_sort_rank (a) - idle_bulk_sort_rank (b);
-            if (rank != 0)
-                return rank;
-            return a.name.collate (b.name);
-        });
-        return list;
-    }
-
-    private void try_idle_bulk_step () {
-        if (!idle_bulk_align_allowed ()) {
-            Utils.sync_log ("idle bulk align: skipped (compose/busy/priority work)");
-            return;
-        }
-
-        var list = idle_bulk_candidates ();
-        if (list.length == 0) {
-            Utils.sync_log ("idle bulk align: nothing to do");
-            return;
-        }
-
-        if (this.idle_bulk_cursor >= list.length)
-            this.idle_bulk_cursor = 0;
-        var folder = list[this.idle_bulk_cursor];
-        this.idle_bulk_cursor++;
-
-        Utils.sync_log (
-            "idle bulk align: “%s” (kind=%d total=%d) rank=%d".printf (
-                folder.name,
-                (int) folder.kind,
-                folder.total,
-                RANK_IDLE_BULK
-            )
-        );
-        enqueue_sync_job (SYNC_KIND_HEADERS, folder, RANK_IDLE_BULK);
-        pump_sync.begin ();
     }
 
     private void enqueue_cache_align () {
@@ -2477,32 +2368,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         }
     }
 
-    private async void sync_mailbox (Cancellable cancellable) {
-        var account = this.selected_account;
-        if (this.mail_session == null || account == null)
-            return;
-
-        var current = this.selected_folder;
-        if (current == null)
-            return;
-        if (folder_skips_startup_bulk (current)) {
-            Utils.sync_log (
-                "lean startup: skip disk collect for large “%s” (total=%d)".printf (
-                    current.name,
-                    current.total
-                )
-            );
-            return;
-        }
-
-        var token = show_sync_status (_("Reading mailbox…"));
-        try {
-            yield hydrate_folder_headers (account, current, cancellable);
-        } finally {
-            hide_sync_status (token);
-        }
-    }
-
     private void queue_conversation_refresh () {
         if (!this.conversation_view || this.search_text.length > 0 || this.selected_folder == null)
             return;
@@ -2515,20 +2380,6 @@ public class Mail.Window : Adw.ApplicationWindow {
             redisplay_current_list ();
             return Source.REMOVE;
         });
-    }
-
-    private GenericArray<Message> listed_messages (GenericArray<Message> messages) {
-        if (!this.unread_only)
-            return messages;
-
-        var listed = new GenericArray<Message> ();
-        for (uint i = 0; i < messages.length; i++) {
-            var message = messages[i];
-            if (message.seen && message.uid != this.open_message_uid)
-                continue;
-            listed.add (message);
-        }
-        return listed;
     }
 
     private bool message_matches_search (Message message) {
@@ -3108,11 +2959,9 @@ public class Mail.Window : Adw.ApplicationWindow {
         this.idle_cancellable?.cancel ();
         this.idle_cancellable = new Cancellable ();
         this.sync_jobs = new GenericArray<MailSyncJob> ();
-        this.idle_bulk_cursor = 0;
         this.folder_scout_cursor = 0;
         this.body_fill_folder = null;
         clear_all_bulk_refresh_backoff ();
-        stop_idle_bulk_align ();
         stop_folder_scout ();
         this.mail_session?.unwatch_all_folders ();
         bind_reader_mailbox ();
@@ -3905,10 +3754,7 @@ public class Mail.Window : Adw.ApplicationWindow {
             }
         }
         cached = this.message_cache.get (cache_key);
-        /* No Graph on folder open (Archive/Inbox/…). Drafts is the exception:
-         * compose append hits the server immediately, but Letter stays
-         * cache-first — a brief tip align on open picks up the new UID without
-         * a full Update Folder. */
+        /* Drafts: brief tip on open so a just-saved draft appears without Update Folder. */
         if (folder.kind == FolderKind.DRAFTS)
             maybe_enqueue_drafts_open_brief (account, folder);
         if ((cached == null || cached.length == 0)
@@ -6433,13 +6279,6 @@ public class Mail.Window : Adw.ApplicationWindow {
         sync_important_markers ();
     }
 
-    private Folder? find_important_copy (Message message) {
-        var folder = find_folder_kind (FolderKind.IMPORTANT);
-        if (folder == null)
-            return null;
-        return find_important_uid (message) != null ? folder : null;
-    }
-
     private string? find_important_uid (Message message) {
         var account = this.selected_account;
         var folder = find_folder_kind (FolderKind.IMPORTANT);
@@ -7475,18 +7314,6 @@ public class Mail.Window : Adw.ApplicationWindow {
                 return;
         }
         cache.add (message);
-    }
-
-    private void restore_folder_counts_from_cache (Account account, Folder folder) {
-        var cache = this.message_cache.get (message_cache_key (account, folder));
-        if (cache == null)
-            return;
-
-        int total;
-        int unread;
-        message_counts (cache, out total, out unread);
-        folder.unread = unread;
-        folder.total = total;
     }
 
     private void drop_conversation_row (Conversation conversation) {
@@ -9216,7 +9043,6 @@ public class Mail.Window : Adw.ApplicationWindow {
             Source.remove (this.sync_source);
             this.sync_source = 0;
         }
-        stop_idle_bulk_align ();
         stop_folder_scout ();
         if (this.search_source != 0) {
             Source.remove (this.search_source);

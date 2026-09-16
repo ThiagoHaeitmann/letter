@@ -1219,16 +1219,6 @@ namespace Mail.Utils {
         return tokens;
     }
 
-    public static bool haystack_matches_tokens (string haystack, GenericArray<string> tokens) {
-        if (tokens.length == 0)
-            return haystack.length > 0;
-        for (uint i = 0; i < tokens.length; i++) {
-            if (!haystack.contains (tokens[i]))
-                return false;
-        }
-        return true;
-    }
-
     public static Pango.AttrList? search_highlight_attrs (string text, GenericArray<string>? tokens) {
         if (tokens == null || tokens.length == 0 || text.length == 0)
             return null;
@@ -1338,12 +1328,6 @@ namespace Mail.Utils {
         if (at < 0 || at + 1 >= needle.length)
             return null;
         return needle.substring (at + 1);
-    }
-
-    public static bool same_mail_domain (string? a, string? b) {
-        var left = email_domain (a);
-        var right = email_domain (b);
-        return left != null && left == right;
     }
 
     public static bool mailbox_uses_org_trust (Account? account) {
@@ -1653,10 +1637,6 @@ namespace Mail.Utils {
         if (raw.strip ().length < 8 && content.plain_text != null && content.plain_text.length > 0)
             raw = content.plain_text;
         return clean_quote_text (raw);
-    }
-
-    public static string quote_body_text (string? text) {
-        return clean_quote_text (text);
     }
 
     private static string format_quote_recipients (GenericArray<Recipient>? recipients, string? fallback) {
