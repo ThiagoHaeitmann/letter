@@ -10,7 +10,7 @@ This is not a GNOME Core application, but it follows the clean GNOME 50 look and
 
 Feel free to try it out and enjoy the app's potential. All feedback is welcome.
 
-**1.0.0-rc.3** is the current release candidate toward 1.0. It is meant for daily use: reading, composing, search, notifications, and cache-first sync are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. This RC gathers feedback before **1.0.0**.
+**1.0.0-rc.4** is the current release candidate toward 1.0. It is meant for daily use: reading, composing, search, notifications, and cache-first sync are in place. Account setup still happens only in GNOME Settings → Online Accounts. There is no in-app IMAP wizard and no mailbox that exists only inside Letter. This RC gathers feedback before **1.0.0**.
 
 ### Available languages
 
@@ -133,13 +133,13 @@ Tip: Use the **Microsoft 365** (Graph) account type, not classic Exchange Web Se
 
 ## Install
 
-There is no Flathub listing and no distro package yet. For **1.0.0-rc.3**, download the **Flatpak bundle** from the [GitHub Releases](https://github.com/stalvatero/letter/releases) page (file named like `Letter-1.0.0-rc.3-x86_64.flatpak`).
+There is no Flathub listing and no distro package yet. For **1.0.0-rc.4**, download the **Flatpak bundle** from the [GitHub Releases](https://github.com/stalvatero/letter/releases) page (file named like `Letter-1.0.0-rc.4-x86_64.flatpak`).
 
 Letter needs the **GNOME Platform 50** runtime from Flathub. Add the Flathub remote once (if it is not already configured), then install the downloaded file:
 
 ```sh
 flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-flatpak install --user ~/Downloads/Letter-1.0.0-rc.3-x86_64.flatpak
+flatpak install --user ~/Downloads/Letter-1.0.0-rc.4-x86_64.flatpak
 ```
 
 Adjust the path to wherever you saved the `.flatpak`. Flatpak will download **org.gnome.Platform//50** from Flathub on first install if it is missing.

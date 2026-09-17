@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 msgid ""
 msgstr ""
-"Project-Id-Version: letter 1.0.0-rc.3\n"
+"Project-Id-Version: letter 1.0.0-rc.4\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2026-09-15 14:16+0200\n"
 "PO-Revision-Date: 2026-09-08 15:22+0200\n"

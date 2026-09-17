@@ -56,7 +56,18 @@
     <category>Email</category>
   </categories>
   <releases>
-    <release version="@version@" type="development" date="2026-09-14">
+    <release version="@version@" type="development" date="2026-09-17">
+      <description>
+        <p>
+          Fourth 1.0 release candidate. Recipient chips offer Write to and Copy
+          Email; compose gains high priority, Paste and Match Style, and Space
+          to commit addresses. Open and save .eml files, bulk actions in
+          multi-select, quieter Archive/Sent sync, Draft tip refresh, and
+          aggregate notification sound.
+        </p>
+      </description>
+    </release>
+    <release version="1.0.0-rc.3" type="development" date="2026-09-14">
       <description>
         <p>
           Third 1.0 release candidate. Soft archive, trash, move, and flags

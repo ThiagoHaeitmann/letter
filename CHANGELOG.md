@@ -7,7 +7,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 How we maintain it:
 
-- During development, add bullets under **[Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.3...HEAD)**.
+- During development, add bullets under **[Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.4...HEAD)**.
 - On each release (rc or stable), rename that section to the version + date, and
 copy a short summary into `data/io.github.stalvatero.Letter.metainfo.xml.in.in`
 (`<releases>`, leave msgstr empty in po files — keep release notes in English)
@@ -17,7 +17,11 @@ refactors unless they affect behaviour.
 
 
 
-## [Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.3...HEAD)
+## [Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.4...HEAD)
+
+
+
+## [1.0.0-rc.4](https://github.com/stalvatero/letter/compare/v1.0.0-rc.3...v1.0.0-rc.4) - 2026-09-17
 
 
 
