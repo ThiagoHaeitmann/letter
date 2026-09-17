@@ -20,6 +20,11 @@ refactors unless they affect behaviour.
 ## [Unreleased](https://github.com/stalvatero/letter/compare/v1.0.0-rc.4...HEAD)
 
 
+### Translations
+
+- Added Brazilian Portuguese translation.
+
+
 
 ## [1.0.0-rc.4](https://github.com/stalvatero/letter/compare/v1.0.0-rc.3...v1.0.0-rc.4) - 2026-09-17
 
