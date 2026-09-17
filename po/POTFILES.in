@@ -21,6 +21,9 @@ src/signature-editor.vala
 src/format-toolbar.vala
 src/utils.vala
 src/welcome-dialog.vala
+src/welcome-tour.vala
+src/outbox-store.vala
+src/theme-selector.vala
 src/invitation-bar.vala
 src/calendar-store.vala
 src/message-window.vala

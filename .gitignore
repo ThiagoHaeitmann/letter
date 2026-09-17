@@ -1,8 +1,11 @@
 /_build/
+/_build-deb/
 /build/
+/build-deb/
 /_flatpak_build/
 .flatpak-builder/
 *.flatpak
+*.deb
 /repo/
 *~
 *.swp
