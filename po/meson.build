@@ -1,4 +1,10 @@
-i18n.gettext(meson.project_name(), preset: 'glib')
+# Keep release descriptions translatable across gettext/AppStream versions.
+i18n.gettext(
+  meson.project_name(),
+  preset: 'glib',
+  data_dirs: ['.'],
+  args: ['--package-version=' + meson.project_version()],
+)
 
 # Compile .mo files into the build locale dir so `meson devenv` can find them.
 fs = import('fs')

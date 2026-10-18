@@ -1,5 +1,7 @@
 data/io.github.stalvatero.Letter.desktop.in.in
 data/io.github.stalvatero.Letter.metainfo.xml.in.in
+data/io.github.stalvatero.Letter.gschema.xml.in
+data/io.github.stalvatero.Mail.gschema.xml.in
 src/application.vala
 src/window.vala
 src/window.blp

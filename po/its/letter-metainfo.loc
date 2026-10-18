@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<locatingRules>
+  <locatingRule name="Letter AppStream" pattern="*.metainfo.xml*">
+    <documentRule localName="component" target="letter-metainfo.its"/>
+  </locatingRule>
+</locatingRules>
