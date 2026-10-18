@@ -327,6 +327,9 @@ namespace Mail.Utils {
         if (spawn_host_or_local (cmd))
             return;
 
+        if (spawn_host_or_local ({ "gnome-online-accounts-gtk" }))
+            return;
+
         warning ("Could not open GNOME Settings → Online Accounts");
     }
 
